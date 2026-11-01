@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,7 +34,60 @@ def _jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in file if line.strip()]
 
 
-def inspect_dataset(root: Path) -> dict:
+def unexpected_parquet_columns(features: dict, columns: list[str]) -> list[str]:
+    """Find payload columns absent from info.json's non-video feature map."""
+    expected = {key for key, value in features.items() if value.get("dtype") != "video"}
+    return sorted(set(columns) - expected)
+
+
+def _parquet_schema_issues(root: Path, features: dict) -> list[tuple[Path, list[str], list[str]]]:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required to inspect v3 parquet; install LeRobot first") from exc
+    expected = {key for key, value in features.items() if value.get("dtype") != "video"}
+    issues = []
+    for path in sorted((root / "data").rglob("*.parquet")):
+        actual = pq.read_schema(path).names
+        extra = unexpected_parquet_columns(features, actual)
+        missing = sorted(expected - set(actual))
+        if extra or missing:
+            issues.append((path, extra, missing))
+    return issues
+
+
+def repair_parquet_schema(root: Path) -> int:
+    """Drop known legacy reward columns from v3 parquet, keeping a per-file backup."""
+    info = _read_json(root / "meta" / "info.json")
+    if info.get("codebase_version") != "v3.0":
+        raise ValueError("Schema repair requires a converted v3.0 dataset")
+    import pyarrow.parquet as pq
+
+    issues = _parquet_schema_issues(root, info["features"])
+    for path, extra, missing in issues:
+        if missing:
+            raise ValueError(f"Parquet lacks declared features {missing}: {path}")
+        unknown = sorted(set(extra) - {"next_reward", "next_done"})
+        if unknown:
+            raise ValueError(f"Refusing to remove unrecognized data columns {unknown}: {path}")
+        backup = path.with_name(path.name + ".before_schema_fix")
+        if backup.exists():
+            raise ValueError(f"Backup already exists; inspect before retrying: {backup}")
+        temp = path.with_name(path.name + ".schema_fix_tmp")
+        original = pq.read_table(path)
+        keep = [name for name in original.column_names if name not in extra]
+        cleaned = original.select(keep).replace_schema_metadata(None)
+        pq.write_table(cleaned, temp, compression="zstd")
+        if pq.read_metadata(temp).num_rows != pq.read_metadata(path).num_rows:
+            temp.unlink()
+            raise ValueError(f"Row count changed during repair: {path}")
+        shutil.copy2(path, backup)
+        os.replace(temp, path)
+        print(f"Removed undeclared columns {extra} from {path}; backup: {backup}", flush=True)
+    return len(issues)
+
+
+def inspect_dataset(root: Path, check_schema: bool = True) -> dict:
     """Check metadata and payload presence before a costly conversion or train run."""
     root = root.resolve()
     info = _read_json(root / "meta" / "info.json")
@@ -85,6 +140,14 @@ def inspect_dataset(root: Path) -> dict:
             raise ValueError("Missing v3 tasks.parquet")
         if not list((root / "meta" / "episodes").rglob("*.parquet")):
             raise ValueError("Missing v3 episode metadata")
+        if check_schema:
+            issues = _parquet_schema_issues(root, features)
+            if issues:
+                path, extra, missing = issues[0]
+                raise ValueError(
+                    f"Parquet columns differ from meta/info.json in {path}: "
+                    f"undeclared={extra}, missing={missing}. Run 'repair' before training."
+                )
     return {"root": str(root), "version": version, "episodes": episodes, "cameras": cameras}
 
 
@@ -131,7 +194,7 @@ def build_train_command(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("inspect", "convert", "download", "train"))
+    parser.add_argument("action", choices=("inspect", "convert", "repair", "download", "train"))
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--lerobot", type=Path, default=DEFAULT_LEROBOT)
     parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
@@ -153,9 +216,17 @@ def main() -> None:
         snapshot_download(repo_id="lerobot/pi05_base", local_dir=args.weights)
         print("Base weights downloaded. The gated PaliGemma tokenizer requires HF access during training.")
         return
-    summary = inspect_dataset(args.dataset)
+    summary = inspect_dataset(args.dataset, check_schema=args.action == "inspect" or args.action == "train")
     print(json.dumps(summary, indent=2), flush=True)
     if args.action == "inspect":
+        return
+    if args.action == "repair":
+        if args.dry_run:
+            print("Schema repair dry run: no files changed.")
+            return
+        count = repair_parquet_schema(args.dataset)
+        print(f"Repaired {count} parquet files.")
+        print(json.dumps(inspect_dataset(args.dataset), indent=2))
         return
     if args.action == "convert":
         if summary["version"] == "v3.0":
@@ -176,6 +247,7 @@ def main() -> None:
     if not args.dry_run:
         subprocess.run(command, check=True)
         if args.action == "convert":
+            repair_parquet_schema(args.dataset)
             print(json.dumps(inspect_dataset(args.dataset), indent=2))
 
 

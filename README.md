@@ -71,7 +71,16 @@ python -m scripts.pipeline convert
 python -m scripts.pipeline inspect
 ```
 
-LeRobot v0.6.1 的转换器会将 `datasets/Lerobot_1028_12_dim/` 原位置替换为 v3.0，并保留 `datasets/Lerobot_1028_12_dim_old/` 原始 v2.1 备份。脚本强制 `--push-to-hub=false`，不会上传数据。**转换可能需要较长时间和额外磁盘空间**，尤其因为视频要拼接。转换中断时先检查 `_old`、`_v30` 目录及 `meta/info.json`，不要盲目删除备份。转换成功后再次运行会跳过。
+LeRobot v0.6.1 的转换器会将 `datasets/Lerobot_1028_12_dim/` 原位置替换为 v3.0，并保留 `datasets/Lerobot_1028_12_dim_old/` 原始 v2.1 备份。脚本强制 `--push-to-hub=false`，不会上传数据。转换后，脚本还会删除 Parquet 中不在 `meta/info.json` 声明的旧字段 `next_reward`、`next_done`；每个修改过的 Parquet 文件都会留下 `.before_schema_fix` 备份。**转换可能需要较长时间和额外磁盘空间**，尤其因为视频要拼接。转换中断时先检查 `_old`、`_v30` 目录及 `meta/info.json`，不要盲目删除备份。转换成功后再次运行会跳过。
+
+如果此前已运行旧版脚本，数据已是 v3.0，但训练报 `CastError: column names don't match`，请在更新本仓库后运行：
+
+```bash
+python -m scripts.pipeline repair
+python -m scripts.pipeline inspect
+```
+
+`repair` 只处理 `next_reward`、`next_done` 这两个多余字段，不会再次转换视频或上传数据。若出现其他未声明字段，它会停止并报告列名。
 
 ### 5. 启动训练
 

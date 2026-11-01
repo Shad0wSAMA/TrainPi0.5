@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.pipeline import build_train_command, inspect_dataset, make_conversion_command
+from scripts.pipeline import build_train_command, inspect_dataset, make_conversion_command, unexpected_parquet_columns
 
 
 def sample_dataset(root: Path, version: str = "v2.1") -> None:
@@ -41,6 +41,16 @@ def sample_dataset(root: Path, version: str = "v2.1") -> None:
 
 
 class PipelineTest(unittest.TestCase):
+    def test_unexpected_parquet_columns_excludes_video_features(self):
+        features = {
+            "action": {"dtype": "float32"},
+            "observation.state": {"dtype": "float32"},
+            "observation.images.head": {"dtype": "video"},
+            "next_reward": {"dtype": "float32"},
+        }
+        columns = ["action", "observation.state", "next_done", "next_reward"]
+        self.assertEqual(unexpected_parquet_columns(features, columns), ["next_done"])
+
     def test_inspect_validates_actual_files_and_features(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
             root = Path(tmp) / "dataset"
