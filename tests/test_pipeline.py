@@ -82,6 +82,7 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("--policy.gradient_checkpointing=true", command)
         self.assertIn("--policy.push_to_hub=false", command)
         self.assertIn("--dataset.video_backend=pyav", command)
+        self.assertIn("--dataset.use_imagenet_stats=false", command)
         self.assertNotIn("--policy.path=/weights/pi05_base", command)
         full = build_train_command(Path("/data/demo"), Path("/weights/pi05_base"), Path("/runs/demo"), 8, 100, 2, full_finetune=True)
         self.assertIn("--policy.train_expert_only=false", full)

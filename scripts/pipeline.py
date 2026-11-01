@@ -169,6 +169,7 @@ def build_train_command(
         "--dataset.repo_id=local/pi05_vial",
         f"--dataset.root={dataset.resolve()}",
         "--dataset.video_backend=pyav",
+        "--dataset.use_imagenet_stats=false",
         "--policy.type=pi05",
         f"--policy.pretrained_path={weights.resolve()}",
         "--policy.device=cuda",

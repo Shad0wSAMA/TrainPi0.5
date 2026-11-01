@@ -93,6 +93,8 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 默认设置：加载 `lerobot/pi05_base` 的**权重**并按本地数据构造输入特征；两路相机、12 维状态/动作、50 步 action chunk、执行 10 步；bfloat16、梯度检查点、冻结视觉语言模型并训练 action expert。默认单卡 batch size 8，偏向稳定启动；若显存充裕可提高到 16/32，并用 `nvidia-smi` 观察峰值。训练步数、batch size 和 worker 数均可通过脚本参数调整。更完整但显存需求更高的微调可添加 `--full-finetune`；建议先降低 batch size。其他未封装的 LeRobot 参数可附加在命令末尾。
 
+此数据集没有相机的图像统计项，且 π₀.₅ 的 `VISUAL` 归一化为 `IDENTITY`。脚本因此设置 `--dataset.use_imagenet_stats=false`，避免 LeRobot 对不存在的图像统计项执行写入。已经转换和修复的数据不需要再次处理。
+
 建议用 `tmux` 保持 SSH 断线后训练继续：
 
 ```bash
