@@ -6,6 +6,22 @@
 
 `scripts/pipeline.py` 是本仓库的入口，提供 `inspect`、`convert`、`repair`、`download`、`train` 五个动作。它检查本地数据，调用 LeRobot v0.6.1 的转换器与 `lerobot-train`；模型结构、数据加载、损失计算和优化器均由 LeRobot 实现。本仓库没有自行实现 π₀.₅ 的训练循环。
 
+## π₀ 与本仓库使用的 π₀.₅
+
+π₀ 系列属于视觉、语言、动作联合建模的机器人策略。本仓库训练的是 LeRobot `policy.type=pi05`，因此下面的细节以 **LeRobot v0.6.1 的 π₀.₅ 实现**为准，不能直接套用到其他 π₀ 实现。
+
+### 输入、主干和动作专家
+
+一次推理读取当前时刻的两路相机图像、`observation.state` 和任务文本。视觉编码器把图像转成视觉 token；状态先按训练集的 `q01/q99` 做分位数归一化，再离散成 256 个区间，与任务说明拼成语言提示并送进 PaliGemma 的语言主干。π₀.₅ 在此实现中**没有单独的连续状态分支**：状态包含在文本 token 中。图像会按比例缩放并填充到 224×224，进入视觉主干前转换到 `[-1, 1]`。参考 [LeRobot π₀.₅ 模型代码](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/policies/pi05/modeling_pi05.py) 和 [输入/输出处理器](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/policies/pi05/processor_pi05.py)。
+
+PaliGemma 形成图像与语言条件的前缀；另一个 Gemma action expert 接收带噪动作块和时间步，输出动作流的速度估计。两个分支在联合注意力中交互。模型内部把较短的状态/动作维度填充到最多 32 维，但输出和损失会裁回数据实际的 12 维。当前 12 维中后六维本身又是数据集提供的零填充，因此查看运动关节时应重点看前六维。默认 `train_expert_only=true` 冻结视觉语言主干，训练动作专家及相关投影；`--full-finetune` 解除此限制。配置细节见 [π₀.₅ 配置源码](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/policies/pi05/configuration_pi05.py)。
+
+### 动作块与 flow matching
+
+每次模型预测一个 50 帧的 action chunk。训练时，对真实动作块 `a` 采样噪声 `ε` 和时间 `t`，构造 `x_t = (1-t)a + tε`；网络预测目标速度 `ε-a`，并以逐维均方误差训练。它学习的是从噪声回到动作的流场，训练 loss **不是**直接计算预测关节值与真值关节值的误差。推理时从随机噪声出发，默认用 10 个积分步骤生成整块动作。本仓库设 `n_action_steps=10`，即每次只执行前 10 帧后再根据新观测重新规划。训练目标与推理实现见 [LeRobot π₀.₅ 模型代码](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/policies/pi05/modeling_pi05.py)。
+
+状态和动作的数值由预处理器按训练集统计归一化，模型输出由后处理器恢复到原始动作单位。评估或部署时必须加载**该训练检查点旁保存的预处理器与后处理器**，否则关节曲线的尺度没有可比性。当前配置 `use_relative_actions=false`，所以输出仍是绝对关节目标。参考 [处理器源码](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/policies/pi05/processor_pi05.py)。
+
 ```text
 原始 LeRobot v2.1 数据 ──inspect──> convert ──> v3.0 数据 ──inspect──┐
                                   └──> 修复旧 Parquet 字段             ├──> train ──> outputs/ 检查点
@@ -68,6 +84,8 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 短跑用于实际验证视频解码、tokenizer 访问、CUDA 和模型前向/反向路径。正式训练建议用 `tmux` 保持会话，观察日志、GPU 显存和磁盘空间。训练输出由 LeRobot 写入 `--output` 指定的目录。
 
+一次训练更新中，LeRobot 从 episode 中采样帧和未来动作窗口，解码两路视频，准备任务文本，归一化状态与动作；然后计算 flow matching loss、反向传播、更新优化器与学习率计划。日志中的 `loss_per_dim` 是**归一化空间的流匹配损失**，并非实际关节单位下的跟踪 MSE。当前脚本每 20 步记录日志、每 1,000 步保存检查点。训练代码见 [LeRobot v0.6.1 训练入口](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/scripts/lerobot_train.py)。
+
 ## 当前训练配置
 
 `train` 先要求数据已是 v3.0，并检查权重目录中存在 `config.json`，随后构造 `lerobot-train` 命令。关键默认值如下：
@@ -111,3 +129,38 @@ lerobot-train --config_path=/实际路径/train_config.json --resume=true
 python -m scripts.pipeline --help
 python -m scripts.pipeline train --dataset /data/my_dataset --weights /models/pi05_base --output /runs/exp1 --steps 1000 --batch-size 4 --workers 2 --dry-run
 ```
+
+## 训练完成后如何检验效果
+
+### 1. 逐关节离线轨迹对比
+
+先找到**训练后的策略目录**（其中有 `config.json`、模型权重以及预/后处理器配置），再运行评估脚本。不要把 `models/pi05_base` 当成训练结果。
+
+脚本需要训练环境中的 LeRobot v0.6.1、NumPy 和 Matplotlib；如缺少绘图库，运行 `python -m pip install matplotlib`。
+
+```bash
+find outputs/pi05_vial -name config.json
+python -m scripts.eval_joints \
+  --checkpoint /实际路径/训练后策略目录 \
+  --dataset datasets/Lerobot_1028_12_dim \
+  --episode 7 \
+  --output outputs/eval_joints
+```
+
+脚本针对一个 episode，在第 0、10、20……帧（或检查点配置的 `n_action_steps` 间隔）读取**数据集记录的真实图像、状态和任务文本**，每次预测一个动作块并取前 10 帧。最后一块按 episode 长度裁剪。它将预测动作经检查点后处理器恢复原始单位，与同一帧的 `action` 比较。默认只绘制非 `padding_*` 的六个关节/夹爪维度，并生成：
+
+- `episode_007.png`：每个关节一幅子图，蓝线为真值、橙线为预测、红点为推理起点，与示例图的读法一致。
+- `episode_007_metrics.csv`：每个维度的原始单位 MSE 和 MAE。
+- `episode_007_trajectory.csv`：逐帧真值、预测值、推理起点标记，便于进一步分析。
+
+可用 `--horizon` 改变每次取用的预测步数，数值不能超过 `chunk_size`；为了模拟当前部署设置，通常保持默认。`--seed` 固定推理噪声以便重复比较。图中的红点标记**重新推理时刻的真值位置**，不是机器人实际执行后的观测。
+
+曲线分析时重点看关节跳变处的滞后、过冲、平台段抖动，以及夹爪开合是否及时。MSE 对大误差更敏感，MAE 更容易解释为平均偏差；不同关节量纲和活动范围可能不同，应逐维比较。示例图中个别维度明显振荡，即使总 MSE 看起来可接受也值得检查。
+
+### 2. 解释离线指标的边界
+
+此评估每次都从数据集读取**真实历史观测**，预测动作不会驱动下一帧状态，因此它是 teacher-forced 的离线动作拟合检查，不能证明闭环控制稳定。当前元数据把 75 个 episode 全部列在训练 split 中；若直接用这些 episode 评估，得到的是训练集拟合程度，不能当作泛化性能。要比较模型或调参，应按 episode 留出一组从未参与训练的验证/测试数据，并保持两路相机、任务描述和关节单位一致。对同一评估集，建议比较基座、不同 checkpoint 及简单的“保持上一动作”基线。
+
+### 3. 真机/仿真闭环验证
+
+在实际部署接口中，逐次输入当前相机、状态、任务文本，执行前 10 步预测动作后再次观测。先核对 12 维顺序、前六维的单位与限位、夹爪定义、30 FPS 与控制频率的映射，以及后六维零填充的处理；然后在安全约束下记录任务成功率、失败类型、动作延迟和异常振荡。当前数据目录包含 `labels/task_success.csv`，但训练脚本不使用它；评估成功率时可作为标签来源之一，仍需核对标签与 episode 的对应关系。
