@@ -1,0 +1,23 @@
+# Raw and converted datasets (including upstream conversion backup)
+/datasets/
+/*_v30/
+/*_old/
+
+# External checkout and downloaded artifacts
+/lerobot/
+/models/
+/outputs/
+/checkpoints/
+/logs/
+/wandb/
+/.cache/
+/.venv/
+/venv/
+
+# Python and local tooling
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.ruff_cache/
+.DS_Store
