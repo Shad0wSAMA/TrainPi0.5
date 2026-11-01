@@ -2,6 +2,8 @@
 
 这个仓库提供本地数据检查、LeRobot v2.1 → v3.0 转换、基座权重下载和训练启动脚本。实际模型、数据加载与优化器由固定版本的 [LeRobot v0.6.1](https://github.com/huggingface/lerobot/releases/tag/v0.6.1) 提供，避免复制并维护一套会过时的训练实现。
 
+训练步骤、默认参数及 π₀.₅ 训练注意事项见[训练流程指南](docs/training_guide.md)。
+
 ## 数据格式
 
 脚本默认读取 `datasets/Lerobot_1028_12_dim/`。当前样本元数据：75 个 episode、41,952 帧、30 FPS、两个任务；`observation.images.head` 和 `observation.images.wrist` 两路 480×640 AV1 视频；`observation.state` 与 `action` 均为 12 维 float32。末尾 6 维名为 `padding_6` 至 `padding_11`，统计值全为零。数据是**绝对关节位置**，因此默认不启用相对动作。`meta/stats.json` 已包含量化归一化需要的 `q01/q99`。标签文件 `labels/task_success.csv` 不参与 LeRobot 的行为克隆训练。
@@ -92,6 +94,14 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 ```
 
 默认设置：加载 `lerobot/pi05_base` 的**权重**并按本地数据构造输入特征；两路相机、12 维状态/动作、50 步 action chunk、执行 10 步；bfloat16、梯度检查点、冻结视觉语言模型并训练 action expert。默认单卡 batch size 8，偏向稳定启动；若显存充裕可提高到 16/32，并用 `nvidia-smi` 观察峰值。训练步数、batch size 和 worker 数均可通过脚本参数调整。更完整但显存需求更高的微调可添加 `--full-finetune`；建议先降低 batch size。其他未封装的 LeRobot 参数可附加在命令末尾。
+
+日志默认每 20 步输出一次，检查点默认每 1000 步保存一次。可用 `--log-freq` 和 `--save-freq` 调整，例如：
+
+```bash
+python -m scripts.pipeline train --steps 30000 --batch-size 8 --log-freq 10 --save-freq 500 --output outputs/pi05_vial
+```
+
+`--save-freq 0` 关闭周期保存，训练结束时仍保存最终检查点。检查点可能很大，应按磁盘空间选择保存间隔。
 
 此数据集没有相机的图像统计项，且 π₀.₅ 的 `VISUAL` 归一化为 `IDENTITY`。脚本因此设置 `--dataset.use_imagenet_stats=false`，避免 LeRobot 对不存在的图像统计项执行写入。已经转换和修复的数据不需要再次处理。
 

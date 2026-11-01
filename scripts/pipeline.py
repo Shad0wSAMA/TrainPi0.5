@@ -160,10 +160,12 @@ def make_conversion_command(lerobot: Path, dataset: Path, repo_id: str) -> list[
 
 def build_train_command(
     dataset: Path, weights: Path, output: Path, batch_size: int, steps: int, workers: int,
-    full_finetune: bool = False,
+    full_finetune: bool = False, log_freq: int = 20, save_freq: int = 1000,
 ) -> list[str]:
     if min(batch_size, steps) < 1 or workers < 0:
         raise ValueError("batch-size and steps must be positive; workers cannot be negative")
+    if log_freq < 1:
+        raise ValueError("log-freq must be positive")
     return [
         "lerobot-train",
         "--dataset.repo_id=local/pi05_vial",
@@ -186,8 +188,8 @@ def build_train_command(
         f"--batch_size={batch_size}",
         f"--steps={steps}",
         f"--num_workers={workers}",
-        "--save_freq=1000",
-        "--log_freq=20",
+        f"--save_freq={save_freq}",
+        f"--log_freq={log_freq}",
         "--seed=1000",
         "--wandb.enable=false",
     ]
@@ -204,6 +206,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=30000)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--log-freq", type=int, default=20, help="Log every N training steps")
+    parser.add_argument("--save-freq", type=int, default=1000, help="Save every N steps; 0 saves only at the end")
     parser.add_argument("--full-finetune", action="store_true", help="Train the VLM as well; uses more VRAM")
     parser.add_argument("--dry-run", action="store_true")
     args, extra = parser.parse_known_args()
@@ -241,7 +245,7 @@ def main() -> None:
             raise ValueError(f"Base checkpoint config.json missing in {args.weights}; run 'download' first")
         command = build_train_command(
             args.dataset, args.weights, args.output, args.batch_size, args.steps, args.workers,
-            full_finetune=args.full_finetune,
+            full_finetune=args.full_finetune, log_freq=args.log_freq, save_freq=args.save_freq,
         )
         command += extra
     print("Command:", " ".join(command), flush=True)

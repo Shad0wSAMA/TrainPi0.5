@@ -88,6 +88,16 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("--policy.train_expert_only=false", full)
         self.assertIn("--policy.freeze_vision_encoder=false", full)
 
+    def test_train_command_accepts_log_and_save_frequencies(self):
+        command = build_train_command(
+            Path("/data/demo"), Path("/weights/pi05_base"), Path("/runs/demo"),
+            8, 100, 2, log_freq=5, save_freq=50,
+        )
+        self.assertIn("--log_freq=5", command)
+        self.assertIn("--save_freq=50", command)
+        self.assertNotIn("--log_freq=20", command)
+        self.assertNotIn("--save_freq=1000", command)
+
 
 if __name__ == "__main__":
     unittest.main()
