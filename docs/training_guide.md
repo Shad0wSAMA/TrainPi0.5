@@ -103,7 +103,7 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 一次训练更新中，LeRobot 从 episode 中采样帧和未来动作窗口，解码两路视频，准备任务文本，归一化状态与动作；然后计算 flow matching loss、反向传播、更新优化器与学习率计划。终端日志中的 `loss` 是**归一化空间的流匹配损失**，并非实际关节单位下的跟踪 MSE。π₀.₅ 虽在前向结果中提供 `loss_per_dim` 列表，但当前 LeRobot 日志聚合器只记录数值标量，不会把该列表逐维写入终端。当前脚本每 20 步打印日志、每 1,000 步保存检查点。训练代码见 [LeRobot v0.6.1 训练入口](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/scripts/lerobot_train.py)。
 
-本仓库的 `pipeline train` 会把终端输出实时保存到 `--output/logs/train_<时间>.log`，并将每次打印的窗口平均 `loss`、梯度范数和学习率写入 `--output/logs/loss_<时间>.csv`，可直接用 CSV 绘制训练曲线。每次启动都会生成新文件；CSV 中的 loss 精度与 LeRobot 终端打印值相同，且不是每一步的原始 loss。当前脚本仍关闭 W&B。直接调用 `lerobot-train`（包括下文的续训示例）不会经过这个记录入口，需自行保存终端输出或启用 W&B。
+本仓库的 `pipeline train` 会把终端输出实时保存到 `--output` 同级的 `<输出目录名>_train_logs/train_<时间>.log`，并将每次打印的窗口平均 `loss`、梯度范数和学习率写入同级的 `loss_<时间>.csv`。训练成功后这两个文件移到 `--output/logs/`；失败时留在暂存目录。这样 LeRobot 启动前不会因为日志目录而发现已存在的输出目录。每次启动都会生成新文件；CSV 中的 loss 精度与 LeRobot 终端打印值相同，且不是每一步的原始 loss。当前脚本仍关闭 W&B。直接调用 `lerobot-train`（包括下文的续训示例）不会经过这个记录入口，需自行保存终端输出或启用 W&B。
 
 ## 当前训练配置
 

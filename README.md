@@ -97,7 +97,7 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 默认设置：加载 `lerobot/pi05_base` 的**权重**并按本地数据构造输入特征；两路相机、12 维状态/动作、50 步 action chunk、执行 10 步；bfloat16、梯度检查点、冻结视觉语言模型并训练 action expert。默认单卡 batch size 8，偏向稳定启动；若显存充裕可提高到 16/32，并用 `nvidia-smi` 观察峰值。训练步数、batch size 和 worker 数均可通过脚本参数调整。更完整但显存需求更高的微调可添加 `--full-finetune`；建议先降低 batch size。其他未封装的 LeRobot 参数可附加在命令末尾。
 
-日志默认每 20 步输出一次，检查点默认每 1000 步保存一次。训练入口现在会同步保存完整终端输出与 loss CSV 到 `--output/logs/`：`train_<时间>.log` 和 `loss_<时间>.csv`。CSV 包含 `step`、原始步数标签、窗口平均 `loss`、梯度范数和学习率；每次启动生成新文件，不覆盖已有记录。可用 `--log-freq` 和 `--save-freq` 调整，例如：
+日志默认每 20 步输出一次，检查点默认每 1000 步保存一次。训练运行期间，完整终端输出与 loss CSV 暂存在输出目录旁的 `<输出目录名>_train_logs/`；训练成功后移入 `--output/logs/`。若训练失败，日志留在暂存目录，且日志记录器不会提前创建 LeRobot 的输出目录。CSV 包含 `step`、原始步数标签、窗口平均 `loss`、梯度范数和学习率；每次启动生成新文件，不覆盖已有记录。可用 `--log-freq` 和 `--save-freq` 调整，例如：
 
 ```bash
 python -m scripts.pipeline train --steps 30000 --batch-size 8 --log-freq 10 --save-freq 500 --output outputs/pi05_vial

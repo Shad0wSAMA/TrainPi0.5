@@ -174,14 +174,31 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual([row["step"] for row in rows], ["20", "40"])
             self.assertEqual([row["loss"] for row in rows], ["0.75", "0.5"])
 
+    def test_logger_does_not_create_training_output_before_child_starts(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            output = Path(tmp) / "new_run"
+            code = (
+                "import pathlib,sys; "
+                "p=pathlib.Path(sys.argv[1]); "
+                "assert not p.exists(), 'output directory existed before trainer validation'; "
+                "p.mkdir(); print('step:20 loss:0.25')"
+            )
+            log_path, csv_path = run_training_with_metrics(
+                [sys.executable, "-c", code, str(output)], output, log_freq=20,
+            )
+            self.assertEqual(log_path.parent, output / "logs")
+            self.assertEqual(csv_path.parent, output / "logs")
+            self.assertIn("loss:0.25", log_path.read_text(encoding="utf-8"))
+
     def test_train_log_preserved_when_child_fails(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
             output = Path(tmp) / "run"
             code = "import sys; print('INFO step:20 loss:1.000', file=sys.stderr); sys.exit(7)"
             with self.assertRaisesRegex(Exception, "7"):
                 run_training_with_metrics([sys.executable, "-c", code], output, log_freq=20)
-            self.assertEqual(len(list((output / "logs").glob("*.csv"))), 1)
-            self.assertEqual(len(list((output / "logs").glob("*.log"))), 1)
+            self.assertFalse(output.exists())
+            self.assertEqual(len(list((output.parent / "run_train_logs").glob("*.csv"))), 1)
+            self.assertEqual(len(list((output.parent / "run_train_logs").glob("*.log"))), 1)
 
     def test_train_recovers_steps_after_lerobot_rounds_labels_to_k(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:

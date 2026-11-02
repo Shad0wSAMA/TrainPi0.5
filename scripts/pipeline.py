@@ -266,11 +266,13 @@ def build_train_command(
 
 def run_training_with_metrics(command: list[str], output: Path, log_freq: int) -> tuple[Path, Path]:
     """Mirror LeRobot output and store its periodic, window-averaged loss as CSV."""
-    logs_dir = output.resolve() / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    output = output.resolve()
+    # LeRobot rejects an output directory that exists before a new run starts.
+    staging_dir = output.parent / f"{output.name}_train_logs"
+    staging_dir.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    log_path = logs_dir / f"train_{run_id}.log"
-    csv_path = logs_dir / f"loss_{run_id}.csv"
+    log_path = staging_dir / f"train_{run_id}.log"
+    csv_path = staging_dir / f"loss_{run_id}.csv"
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     print(f"Training log: {log_path}\nLoss CSV: {csv_path}", flush=True)
@@ -310,7 +312,14 @@ def run_training_with_metrics(command: list[str], output: Path, log_freq: int) -
             exit_code = process.wait()
     if exit_code:
         raise subprocess.CalledProcessError(exit_code, command)
-    return log_path, csv_path
+    final_dir = output / "logs"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    final_log_path = final_dir / log_path.name
+    final_csv_path = final_dir / csv_path.name
+    shutil.move(log_path, final_log_path)
+    shutil.move(csv_path, final_csv_path)
+    print(f"Final training log: {final_log_path}\nFinal loss CSV: {final_csv_path}", flush=True)
+    return final_log_path, final_csv_path
 
 
 def main() -> None:
