@@ -34,6 +34,16 @@ def compare_episode(
     return truth, predicted, starts
 
 
+def select_frame_window(actions: np.ndarray, start_frame: int, max_frames: int | None) -> tuple[np.ndarray, int]:
+    """Select a contiguous episode window while preserving its absolute start index."""
+    if start_frame < 0 or start_frame >= len(actions):
+        raise ValueError(f"start-frame must be between 0 and {len(actions) - 1}")
+    if max_frames is not None and max_frames < 1:
+        raise ValueError("max-frames must be positive")
+    stop = None if max_frames is None else start_frame + max_frames
+    return actions[start_frame:stop], start_frame
+
+
 def joint_metrics(truth: np.ndarray, predicted: np.ndarray, names: list[str]) -> list[dict]:
     if truth.shape != predicted.shape or truth.ndim != 2 or truth.shape[1] != len(names):
         raise ValueError("truth, prediction, and joint names have incompatible shapes")
@@ -44,7 +54,10 @@ def joint_metrics(truth: np.ndarray, predicted: np.ndarray, names: list[str]) ->
     ]
 
 
-def plot_joints(truth: np.ndarray, predicted: np.ndarray, starts: list[int], names: list[str], path: Path) -> None:
+def plot_joints(
+    truth: np.ndarray, predicted: np.ndarray, starts: list[int], names: list[str], path: Path,
+    frame_offset: int = 0,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -52,11 +65,11 @@ def plot_joints(truth: np.ndarray, predicted: np.ndarray, starts: list[int], nam
 
     metrics = joint_metrics(truth, predicted, names)
     fig, axes = plt.subplots(len(names), 1, figsize=(15, max(3 * len(names), 5)), sharex=True, squeeze=False)
-    x = np.arange(len(truth))
+    x = np.arange(len(truth)) + frame_offset
     for i, (ax,) in enumerate(axes):
         ax.plot(x, truth[:, i], label="gt action", linewidth=1.5)
         ax.plot(x, predicted[:, i], label="pred action", linewidth=1.2)
-        ax.scatter(starts, truth[starts, i], c="red", s=18, zorder=3, label="inference point")
+        ax.scatter(np.asarray(starts) + frame_offset, truth[starts, i], c="red", s=18, zorder=3, label="inference point")
         ax.set_title(f"{names[i]}  |  MSE={metrics[i]['mse']:.4g}  MAE={metrics[i]['mae']:.4g}")
         ax.set_ylabel("Action value")
         ax.grid(alpha=0.25)
@@ -114,12 +127,16 @@ def run(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     if args.device.startswith("cuda"):
         torch.cuda.manual_seed_all(args.seed)
-    truth, predicted, starts = compare_episode(actions, dataset.__getitem__, predict, horizon)
+    window, frame_offset = select_frame_window(actions, args.start_frame, args.max_frames)
+    truth, predicted, starts = compare_episode(window, lambda i: dataset[frame_offset + i], predict, horizon)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     shown_names = [names[i] for i in active_dims]
     metrics = joint_metrics(truth[:, active_dims], predicted[:, active_dims], shown_names)
-    plot_joints(truth[:, active_dims], predicted[:, active_dims], starts, shown_names, output / f"episode_{args.episode:03d}.png")
+    plot_joints(
+        truth[:, active_dims], predicted[:, active_dims], starts, shown_names,
+        output / f"episode_{args.episode:03d}.png", frame_offset=frame_offset,
+    )
     with (output / f"episode_{args.episode:03d}_metrics.csv").open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=["joint", "mse", "mae"])
         writer.writeheader()
@@ -128,8 +145,8 @@ def run(args: argparse.Namespace) -> None:
         writer = csv.writer(file)
         writer.writerow(["frame", "inference_point"] + [f"gt_{name}" for name in shown_names] + [f"pred_{name}" for name in shown_names])
         for i in range(len(truth)):
-            writer.writerow([i, int(i in starts)] + truth[i, active_dims].tolist() + predicted[i, active_dims].tolist())
-    print(json.dumps({"episode": args.episode, "frames": len(truth), "horizon": horizon, "metrics": metrics, "output": str(output)}, indent=2))
+            writer.writerow([i + frame_offset, int(i in starts)] + truth[i, active_dims].tolist() + predicted[i, active_dims].tolist())
+    print(json.dumps({"episode": args.episode, "start_frame": frame_offset, "frames": len(truth), "horizon": horizon, "metrics": metrics, "output": str(output)}, indent=2))
 
 
 def main() -> None:
@@ -138,6 +155,8 @@ def main() -> None:
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--repo-id", default="local/pi05_vial")
     parser.add_argument("--episode", type=int, default=0)
+    parser.add_argument("--start-frame", type=int, default=0, help="First episode frame to evaluate")
+    parser.add_argument("--max-frames", type=int, default=None, help="Limit evaluated frames; default entire episode")
     parser.add_argument("--horizon", type=int, default=None, help="Executed predictions per inference; default checkpoint n_action_steps")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1000)

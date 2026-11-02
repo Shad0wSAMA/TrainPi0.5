@@ -1,9 +1,15 @@
 import json
+import csv
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.pipeline import build_train_command, inspect_dataset, make_conversion_command, unexpected_parquet_columns
+from scripts.pipeline import (
+    build_train_command, ensure_quantile_stats_match, inspect_dataset,
+    make_conversion_command, repair_quantile_stats, run_training_with_metrics,
+    unexpected_parquet_columns,
+)
 
 
 def sample_dataset(root: Path, version: str = "v2.1") -> None:
@@ -41,6 +47,59 @@ def sample_dataset(root: Path, version: str = "v2.1") -> None:
 
 
 class PipelineTest(unittest.TestCase):
+    def test_repairs_only_quantiles_and_keeps_backup(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            root = Path(tmp) / "dataset"
+            meta = root / "meta"
+            meta.mkdir(parents=True)
+            source = Path(tmp) / "original.json"
+            current = {key: {"count": [10], "min": [0, 0], "max": [10, 10],
+                             "mean": [5, 5], "q01": [4, 4], "q99": [6, 6]}
+                       for key in ("action", "observation.state")}
+            original = json.loads(json.dumps(current))
+            original["action"]["q01"] = [1, 2]
+            original["action"]["q99"] = [8, 9]
+            (meta / "stats.json").write_text(json.dumps(current))
+            source.write_text(json.dumps(original))
+            self.assertTrue(repair_quantile_stats(root, source))
+            fixed = json.loads((meta / "stats.json").read_text())
+            self.assertEqual(fixed["action"]["q01"], [1, 2])
+            self.assertEqual(fixed["action"]["mean"], [5, 5])
+            self.assertEqual(json.loads((meta / "stats.json.before_quantile_fix").read_text()), current)
+            self.assertFalse(repair_quantile_stats(root, source))
+
+    def test_train_guard_rejects_wrong_quantiles_when_original_backup_exists(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            root = Path(tmp) / "dataset"
+            backup = Path(tmp) / "dataset_old"
+            (root / "meta").mkdir(parents=True)
+            (backup / "meta").mkdir(parents=True)
+            stats = {key: {"count": [10], "min": [0], "max": [10], "mean": [5],
+                           "q01": [2], "q99": [8]} for key in ("action", "observation.state")}
+            original = json.loads(json.dumps(stats))
+            original["action"]["q99"] = [9]
+            (root / "meta" / "stats.json").write_text(json.dumps(stats))
+            (backup / "meta" / "stats.json").write_text(json.dumps(original))
+            with self.assertRaisesRegex(ValueError, "fix-stats"):
+                ensure_quantile_stats_match(root)
+            repair_quantile_stats(root, backup / "meta" / "stats.json")
+            ensure_quantile_stats_match(root)
+
+    def test_repair_refuses_statistics_from_different_dataset(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            root = Path(tmp) / "dataset"
+            (root / "meta").mkdir(parents=True)
+            source = Path(tmp) / "original.json"
+            current = {key: {"count": [10], "min": [0], "max": [10], "mean": [5],
+                             "q01": [2], "q99": [8]} for key in ("action", "observation.state")}
+            original = json.loads(json.dumps(current))
+            original["action"]["count"] = [11]
+            (root / "meta" / "stats.json").write_text(json.dumps(current))
+            source.write_text(json.dumps(original))
+            with self.assertRaisesRegex(ValueError, "count"):
+                repair_quantile_stats(root, source)
+            self.assertFalse((root / "meta" / "stats.json.before_quantile_fix").exists())
+
     def test_unexpected_parquet_columns_excludes_video_features(self):
         features = {
             "action": {"dtype": "float32"},
@@ -97,6 +156,44 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("--save_freq=50", command)
         self.assertNotIn("--log_freq=20", command)
         self.assertNotIn("--save_freq=1000", command)
+
+    def test_train_records_loss_and_full_console_output(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            output = Path(tmp) / "run"
+            code = (
+                "import sys; "
+                "print('start'); "
+                "print('INFO step:20 smpl:160 loss:0.750 grdn:1.250 lr:2.5e-5', file=sys.stderr); "
+                "print('INFO step:40 smpl:320 loss:0.500 grdn:1.000 lr:2.0e-5', file=sys.stderr)"
+            )
+            log_path, csv_path = run_training_with_metrics([sys.executable, "-c", code], output, log_freq=20)
+            self.assertIn("start", log_path.read_text(encoding="utf-8"))
+            self.assertIn("loss:0.750", log_path.read_text(encoding="utf-8"))
+            with csv_path.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual([row["step"] for row in rows], ["20", "40"])
+            self.assertEqual([row["loss"] for row in rows], ["0.75", "0.5"])
+
+    def test_train_log_preserved_when_child_fails(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            output = Path(tmp) / "run"
+            code = "import sys; print('INFO step:20 loss:1.000', file=sys.stderr); sys.exit(7)"
+            with self.assertRaisesRegex(Exception, "7"):
+                run_training_with_metrics([sys.executable, "-c", code], output, log_freq=20)
+            self.assertEqual(len(list((output / "logs").glob("*.csv"))), 1)
+            self.assertEqual(len(list((output / "logs").glob("*.log"))), 1)
+
+    def test_train_recovers_steps_after_lerobot_rounds_labels_to_k(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            code = (
+                "print('step:980 loss:0.8'); "
+                "print('step:1K loss:0.7'); "
+                "print('step:1K loss:0.6')"
+            )
+            _, csv_path = run_training_with_metrics([sys.executable, "-c", code], Path(tmp), log_freq=20)
+            with csv_path.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual([row["step"] for row in rows], ["980", "1000", "1020"])
 
 
 if __name__ == "__main__":

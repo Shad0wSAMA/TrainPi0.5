@@ -6,7 +6,7 @@
 
 ## 数据格式
 
-脚本默认读取 `datasets/Lerobot_1028_12_dim/`。当前样本元数据：75 个 episode、41,952 帧、30 FPS、两个任务；`observation.images.head` 和 `observation.images.wrist` 两路 480×640 AV1 视频；`observation.state` 与 `action` 均为 12 维 float32。末尾 6 维名为 `padding_6` 至 `padding_11`，统计值全为零。数据是**绝对关节位置**，因此默认不启用相对动作。`meta/stats.json` 已包含量化归一化需要的 `q01/q99`。标签文件 `labels/task_success.csv` 不参与 LeRobot 的行为克隆训练。
+脚本默认读取 `datasets/Lerobot_1028_12_dim/`。当前样本元数据：75 个 episode、41,952 帧、30 FPS、两个任务；`observation.images.head` 和 `observation.images.wrist` 两路 480×640 AV1 视频；`observation.state` 与 `action` 均为 12 维 float32。末尾 6 维名为 `padding_6` 至 `padding_11`，统计值全为零。数据是**绝对关节位置**；当前脚本默认直接学习绝对动作。`meta/stats.json` 已包含绝对动作量化归一化需要的 `q01/q99`。如需试验相对动作，必须先为相对动作重算统计值，详见[训练流程指南](docs/training_guide.md#相对动作是否更适合这份数据)。标签文件 `labels/task_success.csv` 不参与 LeRobot 的行为克隆训练。
 
 本仓库忽略 `datasets/`、`lerobot/`、`models/`、`outputs/` 等目录。解压数据和下载模型后，`git status` 不会把这些大文件列为待提交内容。
 
@@ -75,6 +75,8 @@ python -m scripts.pipeline inspect
 
 LeRobot v0.6.1 的转换器会将 `datasets/Lerobot_1028_12_dim/` 原位置替换为 v3.0，并保留 `datasets/Lerobot_1028_12_dim_old/` 原始 v2.1 备份。脚本强制 `--push-to-hub=false`，不会上传数据。转换后，脚本还会删除 Parquet 中不在 `meta/info.json` 声明的旧字段 `next_reward`、`next_done`；每个修改过的 Parquet 文件都会留下 `.before_schema_fix` 备份。**转换可能需要较长时间和额外磁盘空间**，尤其因为视频要拼接。转换中断时先检查 `_old`、`_v30` 目录及 `meta/info.json`，不要盲目删除备份。转换成功后再次运行会跳过。
 
+当前脚本会在转换后恢复原始 v2.1 数据的全局 `q01/q99`，避免 LeRobot 转换器按 episode 平均分位数改变 π₀.₅ 的归一化范围。服务器上已转换的数据只需运行 `python -m scripts.pipeline fix-stats`，然后从基座模型开始训练到新的输出目录；旧检查点不能靠重新评估获得这项修复。详细说明见[训练流程指南](docs/training_guide.md)。
+
 如果此前已运行旧版脚本，数据已是 v3.0，但训练报 `CastError: column names don't match`，请在更新本仓库后运行：
 
 ```bash
@@ -95,7 +97,7 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 默认设置：加载 `lerobot/pi05_base` 的**权重**并按本地数据构造输入特征；两路相机、12 维状态/动作、50 步 action chunk、执行 10 步；bfloat16、梯度检查点、冻结视觉语言模型并训练 action expert。默认单卡 batch size 8，偏向稳定启动；若显存充裕可提高到 16/32，并用 `nvidia-smi` 观察峰值。训练步数、batch size 和 worker 数均可通过脚本参数调整。更完整但显存需求更高的微调可添加 `--full-finetune`；建议先降低 batch size。其他未封装的 LeRobot 参数可附加在命令末尾。
 
-日志默认每 20 步输出一次，检查点默认每 1000 步保存一次。可用 `--log-freq` 和 `--save-freq` 调整，例如：
+日志默认每 20 步输出一次，检查点默认每 1000 步保存一次。训练入口现在会同步保存完整终端输出与 loss CSV 到 `--output/logs/`：`train_<时间>.log` 和 `loss_<时间>.csv`。CSV 包含 `step`、原始步数标签、窗口平均 `loss`、梯度范数和学习率；每次启动生成新文件，不覆盖已有记录。可用 `--log-freq` 和 `--save-freq` 调整，例如：
 
 ```bash
 python -m scripts.pipeline train --steps 30000 --batch-size 8 --log-freq 10 --save-freq 500 --output outputs/pi05_vial
@@ -111,11 +113,11 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --log-freq 10 --sa
 tmux new -s pi05
 conda activate pi05
 cd /path/to/TrainPi0.5
-python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --output outputs/pi05_vial 2>&1 | tee outputs_pi05_vial.log
+python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --output outputs/pi05_vial
 # Ctrl+B 然后 D 可退出 tmux，之后用 tmux attach -t pi05 返回。
 ```
 
-LeRobot 会在指定 `outputs/` 下保存训练配置、日志和检查点。续训时使用 LeRobot 自带接口，指向保存的 `train_config.json`，例如：
+LeRobot 会在指定 `outputs/` 下保存训练配置和检查点。本仓库的 `pipeline train` 负责保存 loss 日志；直接运行 `lerobot-train` 或用下面的命令直接续训时，不会经过这个日志记录入口，应自行重定向输出或启用 W&B。续训时使用 LeRobot 自带接口，指向保存的 `train_config.json`，例如：
 
 ```bash
 find outputs/pi05_vial -name train_config.json

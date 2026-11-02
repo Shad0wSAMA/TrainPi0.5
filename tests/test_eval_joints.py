@@ -4,10 +4,20 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.eval_joints import compare_episode, joint_metrics, plot_joints
+from scripts.eval_joints import compare_episode, joint_metrics, plot_joints, select_frame_window
 
 
 class EvalJointsTest(unittest.TestCase):
+    def test_frame_window_keeps_episode_indices_for_prediction(self):
+        actions = np.arange(20).reshape(10, 2)
+        window, start = select_frame_window(actions, start_frame=4, max_frames=3)
+        np.testing.assert_array_equal(window, actions[4:7])
+        self.assertEqual(start, 4)
+
+    def test_frame_window_rejects_out_of_range_start(self):
+        with self.assertRaisesRegex(ValueError, "start-frame"):
+            select_frame_window(np.zeros((3, 2)), start_frame=3, max_frames=1)
+
     def test_chunks_use_current_observation_and_clip_final_chunk(self):
         rows = [{"action": np.array([i, i + 1], dtype=float), "frame": i} for i in range(5)]
         starts = []

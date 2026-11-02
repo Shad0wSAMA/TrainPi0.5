@@ -22,6 +22,12 @@ PaliGemma 形成图像与语言条件的前缀；另一个 Gemma action expert �
 
 状态和动作的数值由预处理器按训练集统计归一化，模型输出由后处理器恢复到原始动作单位。评估或部署时必须加载**该训练检查点旁保存的预处理器与后处理器**，否则关节曲线的尺度没有可比性。当前配置 `use_relative_actions=false`，所以输出仍是绝对关节目标。参考 [处理器源码](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/policies/pi05/processor_pi05.py)。
 
+### 相对动作是否更适合这份数据
+
+不能仅凭原始数据是绝对关节位置就决定关闭相对动作。启用 `use_relative_actions=true` 后，LeRobot 在训练前对选中的维度计算 `a_relative = a_absolute - 当前 observation.state`，模型学习从当前姿态到目标姿态的偏移；后处理再加回当前状态，给机器人输出绝对目标。默认 `relative_exclude_joints=["gripper"]`，名称含 `gripper` 的夹爪维度仍保持绝对值。实现见 [相对动作处理器](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/processor/relative_action_processor.py)。
+
+这种表示可能更适合“从当前姿态移动到目标”的任务，但并非 π₀.₅ 的普遍最优设置。[官方 π₀.₅ 指南](https://huggingface.co/docs/lerobot/v0.6.1/pi05#relative-actions)也只说它在某些设置下可能改善稳定性。本仓库当前 `meta/stats.json` 的动作统计是**绝对动作分布**；若直接追加 `--policy.use_relative_actions=true`，处理器会先减去状态、再使用不匹配的绝对动作统计归一化，因此不应直接这样训练。应先在独立数据副本上按 `chunk_size=50` 重算相对动作统计，再使用相同的排除维度配置训练，并保留原绝对动作实验作为对照。对这份数据，先确认动作与状态前六维逐一对应、单位一致，尤其要核对夹爪是否应保持绝对值；后六维零填充减去零状态仍为零。
+
 ```text
 原始 LeRobot v2.1 数据 ──inspect──> convert ──> v3.0 数据 ──inspect──┐
                                   └──> 修复旧 Parquet 字段             ├──> train ──> outputs/ 检查点
@@ -66,6 +72,17 @@ python -m scripts.pipeline inspect
 
 `convert` 调用本地 `lerobot/src/lerobot/scripts/convert_dataset_v21_to_v30.py`，传入数据根目录并强制 `--push-to-hub=false`。LeRobot 转换器会在原位置生成 v3.0 数据，保留 `_old` 原始备份。转换完成后，本脚本还会移除 Parquet 中未在 `meta/info.json` 声明的旧字段 `next_reward`、`next_done`，并为每个修改的文件留下 `.before_schema_fix` 备份。已是 v3.0 时再次运行 `convert` 会跳过转换。
 
+转换器会将各 episode 的 `q01/q99` 按帧数加权平均；对于跨 episode 姿态分布差异大的数据，这不等于原始 v2.1 `meta/stats.json` 中的全局分位数。现在 `pipeline convert` 完成后会从 `_old/meta/stats.json` 恢复 `action` 和 `observation.state` 的全局 `q01/q99`，保留转换后的其他统计，并将修改前的 v3 统计备份为 `meta/stats.json.before_quantile_fix`。训练入口若发现 `_old` 中的全局分位数与当前 v3 数据不一致，会在启动前报错。
+
+**服务器上已经转换的数据无需重新转换视频。** 更新仓库后运行：
+
+```bash
+python -m scripts.pipeline fix-stats
+python -m scripts.pipeline inspect
+```
+
+`fix-stats` 会核对样本数、min/max、mean，避免误用另一份数据的统计；原始备份若不在默认的 `datasets/Lerobot_1028_12_dim_old/meta/stats.json`，可用 `--source-stats /原始v2.1数据/meta/stats.json` 指定。已经用旧分位数训练出的检查点需要从基座权重重新训练，不能只替换评估处理器，也不应从旧训练检查点续训。使用**新的**输出目录，例如 `outputs/pi05_vial_global_q`，避免混淆旧实验。
+
 如果以前转换过、现在 `inspect` 报 Parquet 列与 `meta/info.json` 不一致，可执行：
 
 ```bash
@@ -84,7 +101,9 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 短跑用于实际验证视频解码、tokenizer 访问、CUDA 和模型前向/反向路径。正式训练建议用 `tmux` 保持会话，观察日志、GPU 显存和磁盘空间。训练输出由 LeRobot 写入 `--output` 指定的目录。
 
-一次训练更新中，LeRobot 从 episode 中采样帧和未来动作窗口，解码两路视频，准备任务文本，归一化状态与动作；然后计算 flow matching loss、反向传播、更新优化器与学习率计划。日志中的 `loss_per_dim` 是**归一化空间的流匹配损失**，并非实际关节单位下的跟踪 MSE。当前脚本每 20 步记录日志、每 1,000 步保存检查点。训练代码见 [LeRobot v0.6.1 训练入口](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/scripts/lerobot_train.py)。
+一次训练更新中，LeRobot 从 episode 中采样帧和未来动作窗口，解码两路视频，准备任务文本，归一化状态与动作；然后计算 flow matching loss、反向传播、更新优化器与学习率计划。终端日志中的 `loss` 是**归一化空间的流匹配损失**，并非实际关节单位下的跟踪 MSE。π₀.₅ 虽在前向结果中提供 `loss_per_dim` 列表，但当前 LeRobot 日志聚合器只记录数值标量，不会把该列表逐维写入终端。当前脚本每 20 步打印日志、每 1,000 步保存检查点。训练代码见 [LeRobot v0.6.1 训练入口](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/scripts/lerobot_train.py)。
+
+本仓库的 `pipeline train` 会把终端输出实时保存到 `--output/logs/train_<时间>.log`，并将每次打印的窗口平均 `loss`、梯度范数和学习率写入 `--output/logs/loss_<时间>.csv`，可直接用 CSV 绘制训练曲线。每次启动都会生成新文件；CSV 中的 loss 精度与 LeRobot 终端打印值相同，且不是每一步的原始 loss。当前脚本仍关闭 W&B。直接调用 `lerobot-train`（包括下文的续训示例）不会经过这个记录入口，需自行保存终端输出或启用 W&B。
 
 ## 当前训练配置
 
@@ -131,6 +150,30 @@ python -m scripts.pipeline train --dataset /data/my_dataset --weights /models/pi
 ```
 
 ## 训练完成后如何检验效果
+
+### 本地下载检查点后快速试跑
+
+将训练后的 `model.safetensors`、`config.json` 和四个预/后处理器文件放在 `models/pi05/`。本地入口先检查文件、数据版本和依赖，默认评估 episode 7 的第 390–469 帧（8 次推理），便于先查看肩关节的大幅运动：
+
+```powershell
+python -m scripts.eval_local --check-only
+python -m scripts.eval_local
+# 显存不足时可改用 CPU，运行会慢得多：
+python -m scripts.eval_local --device cpu
+```
+
+可用 `--episode`、`--start-frame`、`--max-frames`、`--horizon`、`--output` 调整评估范围。输出与 `eval_joints.py` 相同，CSV 的 `frame` 和图中的横轴保留 episode 原始帧号。需要 LeRobot v0.6.1、PyAV、Parquet 依赖、Matplotlib，以及已获许可并可访问的 `google/paligemma-3b-pt-224` tokenizer。RTX 5070 Ti Laptop GPU 的约 12 GB 显存不保证容纳模型与推理中间张量；CUDA 报显存不足时使用 `--device cpu`。
+
+入口还会逐维比较检查点保存的 `q01/q99` 与本地数据 `meta/stats.json`。目前下载的检查点与本地原始 v2.1 数据的样本数、min/max、mean 基本一致，但 action 和 state 的分位数明显不同。例如 action 的 `shoulder_lift.pos` 的 `q99` 分别为约 -33.38 与 +26.07。这是需要排查的训练数据统计差异；不可只在评估时替换处理器统计值，因为模型是按保存的统计值训练的。LeRobot v0.6.1 的 v2.1→v3.0 转换器会根据每个 episode 的统计重新聚合全局统计，其聚合实现对分位数取按 episode 长度加权的平均，这不等于所有帧的全局分位数。详见[转换器](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/scripts/convert_dataset_v21_to_v30.py)和[统计聚合代码](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/datasets/compute_stats.py)。
+
+当前本地数据仍是 v2.1。先按上文安装固定版本 LeRobot，再在数据副本上转换，避免更改原始文件：
+
+```powershell
+Copy-Item datasets/Lerobot_1028_12_dim datasets/Lerobot_1028_12_dim_eval -Recurse
+python -m scripts.pipeline convert --dataset datasets/Lerobot_1028_12_dim_eval
+python -m scripts.eval_local --dataset datasets/Lerobot_1028_12_dim_eval --check-only
+python -m scripts.eval_local --dataset datasets/Lerobot_1028_12_dim_eval
+```
 
 ### 1. 逐关节离线轨迹对比
 

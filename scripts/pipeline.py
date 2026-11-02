@@ -6,11 +6,15 @@ The actual dataset conversion and training are delegated to the pinned LeRobot c
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -32,6 +36,71 @@ def _jsonl(path: Path) -> list[dict]:
         raise ValueError(f"Missing metadata: {path}")
     with path.open(encoding="utf-8") as file:
         return [json.loads(line) for line in file if line.strip()]
+
+
+def original_stats_path(root: Path) -> Path:
+    """Return the v2.1 backup written by LeRobot's in-place v3 converter."""
+    root = root.resolve()
+    return root.with_name(root.name + "_old") / "meta" / "stats.json"
+
+
+def _validated_quantiles(current: dict, original: dict) -> dict:
+    corrected = json.loads(json.dumps(current))
+    for feature in ("action", "observation.state"):
+        if feature not in current or feature not in original:
+            raise ValueError(f"Missing {feature} statistics")
+        old, new = original[feature], current[feature]
+        for name in ("count", "min", "max", "mean"):
+            left, right = old.get(name), new.get(name)
+            if left is None or right is None or len(left) != len(right):
+                raise ValueError(f"Missing or incompatible {feature}.{name}")
+            tolerance = 0 if name == "count" else 0.05
+            if any(not math.isclose(float(a), float(b), rel_tol=0, abs_tol=tolerance) for a, b in zip(left, right)):
+                raise ValueError(f"Original and converted dataset differ in {feature}.{name}; refusing stats repair")
+        for name in ("q01", "q99"):
+            values = old.get(name)
+            if values is None or len(values) != len(new["min"]) or not all(math.isfinite(float(x)) for x in values):
+                raise ValueError(f"Missing or incompatible original {feature}.{name}")
+            corrected[feature][name] = values
+        if any(low > high for low, high in zip(corrected[feature]["q01"], corrected[feature]["q99"])):
+            raise ValueError(f"Original {feature} q01 exceeds q99")
+    return corrected
+
+
+def repair_quantile_stats(root: Path, source_stats: Path) -> bool:
+    """Restore global v2.1 quantiles after v3 conversion, preserving the converted stats."""
+    target = root / "meta" / "stats.json"
+    current = _read_json(target)
+    corrected = _validated_quantiles(current, _read_json(source_stats))
+    if corrected == current:
+        return False
+    backup = target.with_name(target.name + ".before_quantile_fix")
+    if backup.exists():
+        raise ValueError(f"Stats backup already exists; inspect before retrying: {backup}")
+    temp = target.with_name(target.name + ".quantile_fix_tmp")
+    shutil.copy2(target, backup)
+    try:
+        with temp.open("w", encoding="utf-8") as file:
+            json.dump(corrected, file, indent=2)
+            file.write("\n")
+        os.replace(temp, target)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return True
+
+
+def ensure_quantile_stats_match(root: Path, source_stats: Path | None = None) -> None:
+    """Stop new training when conversion has replaced known global quantiles."""
+    source = source_stats or original_stats_path(root)
+    if not source.is_file():
+        if source_stats is not None:
+            raise ValueError(f"Original stats file missing: {source}")
+        return
+    current = _read_json(root / "meta" / "stats.json")
+    corrected = _validated_quantiles(current, _read_json(source))
+    if corrected != current:
+        raise ValueError("Converted dataset quantiles differ from original global stats. Run 'python -m scripts.pipeline fix-stats' before training.")
 
 
 def unexpected_parquet_columns(features: dict, columns: list[str]) -> list[str]:
@@ -195,14 +264,64 @@ def build_train_command(
     ]
 
 
+def run_training_with_metrics(command: list[str], output: Path, log_freq: int) -> tuple[Path, Path]:
+    """Mirror LeRobot output and store its periodic, window-averaged loss as CSV."""
+    logs_dir = output.resolve() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    log_path = logs_dir / f"train_{run_id}.log"
+    csv_path = logs_dir / f"loss_{run_id}.csv"
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    print(f"Training log: {log_path}\nLoss CSV: {csv_path}", flush=True)
+    previous_step: int | None = None
+    step_pattern = re.compile(r"\bstep:(\d+(?:\.\d+)?[KMBTQ]?)\b")
+    value_pattern = re.compile(r"\b(loss|grdn|lr):([^\s]+)")
+    with log_path.open("w", encoding="utf-8") as log_file, csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=["step", "step_label", "loss", "grad_norm", "lr"])
+        writer.writeheader()
+        csv_file.flush()
+        with subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace", bufsize=1, env=env,
+        ) as process:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log_file.write(line)
+                log_file.flush()
+                step_match = step_pattern.search(line)
+                values = dict(value_pattern.findall(line))
+                if step_match is None or "loss" not in values:
+                    continue
+                label = step_match.group(1)
+                if label[-1] in "KMBTQ":
+                    scale = 1000 ** ("KMBTQ".index(label[-1]) + 1)
+                    step = previous_step + log_freq if previous_step is not None else round(float(label[:-1]) * scale)
+                else:
+                    step = int(label)
+                previous_step = step
+                writer.writerow({
+                    "step": step, "step_label": label, "loss": float(values["loss"]),
+                    "grad_norm": float(values["grdn"]) if "grdn" in values else "",
+                    "lr": float(values["lr"]) if "lr" in values else "",
+                })
+                csv_file.flush()
+            exit_code = process.wait()
+    if exit_code:
+        raise subprocess.CalledProcessError(exit_code, command)
+    return log_path, csv_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("inspect", "convert", "repair", "download", "train"))
+    parser.add_argument("action", choices=("inspect", "convert", "repair", "fix-stats", "download", "train"))
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--lerobot", type=Path, default=DEFAULT_LEROBOT)
     parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
     parser.add_argument("--output", type=Path, default=REPO_ROOT / "outputs" / "pi05_vial")
     parser.add_argument("--repo-id", default="local/pi05_vial")
+    parser.add_argument("--source-stats", type=Path, default=None, help="Original v2.1 meta/stats.json; defaults to the *_old conversion backup")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=30000)
     parser.add_argument("--workers", type=int, default=4)
@@ -233,6 +352,16 @@ def main() -> None:
         print(f"Repaired {count} parquet files.")
         print(json.dumps(inspect_dataset(args.dataset), indent=2))
         return
+    if args.action == "fix-stats":
+        if summary["version"] != "v3.0":
+            raise ValueError("fix-stats requires a converted v3.0 dataset")
+        source = args.source_stats or original_stats_path(args.dataset)
+        if args.dry_run:
+            ensure_quantile_stats_match(args.dataset, source)
+            return
+        changed = repair_quantile_stats(args.dataset, source)
+        print(f"Global quantiles {'restored' if changed else 'already correct'} from {source}")
+        return
     if args.action == "convert":
         if summary["version"] == "v3.0":
             print("Dataset already v3.0; conversion skipped.")
@@ -241,6 +370,7 @@ def main() -> None:
     else:
         if summary["version"] != "v3.0":
             raise ValueError("Dataset is v2.1. Run 'convert' first.")
+        ensure_quantile_stats_match(args.dataset, args.source_stats)
         if not (args.weights / "config.json").is_file():
             raise ValueError(f"Base checkpoint config.json missing in {args.weights}; run 'download' first")
         command = build_train_command(
@@ -250,9 +380,15 @@ def main() -> None:
         command += extra
     print("Command:", " ".join(command), flush=True)
     if not args.dry_run:
-        subprocess.run(command, check=True)
+        if args.action == "train":
+            run_training_with_metrics(command, args.output, args.log_freq)
+        else:
+            subprocess.run(command, check=True)
         if args.action == "convert":
             repair_parquet_schema(args.dataset)
+            source = args.source_stats or original_stats_path(args.dataset)
+            changed = repair_quantile_stats(args.dataset, source)
+            print(f"Global quantiles {'restored' if changed else 'already correct'} from {source}")
             print(json.dumps(inspect_dataset(args.dataset), indent=2))
 
 
