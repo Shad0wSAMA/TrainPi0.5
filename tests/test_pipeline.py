@@ -10,6 +10,7 @@ from scripts.pipeline import (
     make_conversion_command, repair_quantile_stats, run_training_with_metrics,
     unexpected_parquet_columns,
 )
+from scripts.train_episode_safe import configure_episode_safe_sampling
 
 
 def sample_dataset(root: Path, version: str = "v2.1") -> None:
@@ -47,6 +48,21 @@ def sample_dataset(root: Path, version: str = "v2.1") -> None:
 
 
 class PipelineTest(unittest.TestCase):
+    def test_training_uses_episode_safe_entrypoint(self):
+        command = build_train_command(Path("/data/demo"), Path("/weights/pi05_base"), Path("/runs/demo"), 8, 100, 2)
+        self.assertEqual(command[:2], [sys.executable, str(Path(__file__).resolve().parents[1] / "scripts" / "train_episode_safe.py")])
+
+    def test_sampler_drops_tail_without_a_full_action_chunk(self):
+        class PolicyConfig:
+            chunk_size = 3
+
+        configure_episode_safe_sampling(PolicyConfig)
+        config = PolicyConfig()
+        self.assertEqual(config.drop_n_last_frames, 2)
+        self.assertEqual([start for start in range(4 - config.drop_n_last_frames)], [0, 1])
+        config.chunk_size = 4
+        self.assertEqual(config.drop_n_last_frames, 3)
+
     def test_repairs_only_quantiles_and_keeps_backup(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
             root = Path(tmp) / "dataset"

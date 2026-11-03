@@ -236,7 +236,8 @@ def build_train_command(
     if log_freq < 1:
         raise ValueError("log-freq must be positive")
     return [
-        "lerobot-train",
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "train_episode_safe.py"),
         "--dataset.repo_id=local/pi05_vial",
         f"--dataset.root={dataset.resolve()}",
         "--dataset.video_backend=pyav",

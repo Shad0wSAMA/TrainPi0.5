@@ -4,7 +4,7 @@
 
 ## 代码分工
 
-`scripts/pipeline.py` 是本仓库的入口，提供 `inspect`、`convert`、`repair`、`download`、`train` 五个动作。它检查本地数据，调用 LeRobot v0.6.1 的转换器与 `lerobot-train`；模型结构、数据加载、损失计算和优化器均由 LeRobot 实现。本仓库没有自行实现 π₀.₅ 的训练循环。
+`scripts/pipeline.py` 是本仓库的入口，提供 `inspect`、`convert`、`repair`、`download`、`train` 五个动作。它检查本地数据，调用 LeRobot v0.6.1 的转换器与训练入口；模型结构、数据加载、损失计算和优化器均由 LeRobot 实现。本仓库没有自行实现 π₀.₅ 的训练循环。
 
 ## π₀ 与本仓库使用的 π₀.₅
 
@@ -101,13 +101,13 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 短跑用于实际验证视频解码、tokenizer 访问、CUDA 和模型前向/反向路径。正式训练建议用 `tmux` 保持会话，观察日志、GPU 显存和磁盘空间。训练输出由 LeRobot 写入 `--output` 指定的目录。
 
-一次训练更新中，LeRobot 从 episode 中采样帧和未来动作窗口，解码两路视频，准备任务文本，归一化状态与动作；然后计算 flow matching loss、反向传播、更新优化器与学习率计划。终端日志中的 `loss` 是**归一化空间的流匹配损失**，并非实际关节单位下的跟踪 MSE。π₀.₅ 虽在前向结果中提供 `loss_per_dim` 列表，但当前 LeRobot 日志聚合器只记录数值标量，不会把该列表逐维写入终端。当前脚本每 20 步打印日志、每 1,000 步保存检查点。训练代码见 [LeRobot v0.6.1 训练入口](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/scripts/lerobot_train.py)。
+一次训练更新中，LeRobot 从 episode 中采样帧和未来动作窗口，解码两路视频，准备任务文本，归一化状态与动作；然后计算 flow matching loss、反向传播、更新优化器与学习率计划。训练入口会从每条 episode 的可用采样起点中排除最后 `chunk_size - 1` 帧，确保未来动作窗口完整位于同一 episode。终端日志中的 `loss` 是**归一化空间的流匹配损失**，并非实际关节单位下的跟踪 MSE。π₀.₅ 虽在前向结果中提供 `loss_per_dim` 列表，但当前 LeRobot 日志聚合器只记录数值标量，不会把该列表逐维写入终端。当前脚本每 20 步打印日志、每 1,000 步保存检查点。训练代码见 [LeRobot v0.6.1 训练入口](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/scripts/lerobot_train.py)。
 
-本仓库的 `pipeline train` 会把终端输出实时保存到 `--output` 同级的 `<输出目录名>_train_logs/train_<时间>.log`，并将每次打印的窗口平均 `loss`、梯度范数和学习率写入同级的 `loss_<时间>.csv`。训练成功后这两个文件移到 `--output/logs/`；失败时留在暂存目录。这样 LeRobot 启动前不会因为日志目录而发现已存在的输出目录。每次启动都会生成新文件；CSV 中的 loss 精度与 LeRobot 终端打印值相同，且不是每一步的原始 loss。当前脚本仍关闭 W&B。直接调用 `lerobot-train`（包括下文的续训示例）不会经过这个记录入口，需自行保存终端输出或启用 W&B。
+本仓库的 `pipeline train` 会把终端输出实时保存到 `--output` 同级的 `<输出目录名>_train_logs/train_<时间>.log`，并将每次打印的窗口平均 `loss`、梯度范数和学习率写入同级的 `loss_<时间>.csv`。训练成功后这两个文件移到 `--output/logs/`；失败时留在暂存目录。这样 LeRobot 启动前不会因为日志目录而发现已存在的输出目录。每次启动都会生成新文件；CSV 中的 loss 精度与 LeRobot 终端打印值相同，且不是每一步的原始 loss。当前脚本仍关闭 W&B。直接调用续训入口不会经过这个日志记录入口，需自行保存终端输出或启用 W&B。
 
 ## 当前训练配置
 
-`train` 先要求数据已是 v3.0，并检查权重目录中存在 `config.json`，随后构造 `lerobot-train` 命令。关键默认值如下：
+`train` 先要求数据已是 v3.0，并检查权重目录中存在 `config.json`，随后通过 `scripts/train_episode_safe.py` 启动 LeRobot。关键默认值如下：
 
 | 项目 | 当前值 | 影响 |
 | --- | --- | --- |
@@ -135,11 +135,11 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 ## 续训与常用检查
 
-已有 LeRobot 训练配置时，可按 README 中的方式用 `lerobot-train` 续训：
+已有 LeRobot 训练配置时，可按 README 中的方式用 episode 安全入口续训：
 
 ```bash
 find outputs/pi05_vial -name train_config.json
-lerobot-train --config_path=/实际路径/train_config.json --resume=true
+python scripts/train_episode_safe.py --config_path=/实际路径/train_config.json --resume=true
 ```
 
 `pipeline.py` 本身没有 `resume` 动作。自定义路径和参数可先查看帮助并做 dry run：

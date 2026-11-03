@@ -95,7 +95,7 @@ python -m scripts.pipeline train --steps 2 --batch-size 1 --workers 0 --output o
 python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --output outputs/pi05_vial
 ```
 
-默认设置：加载 `lerobot/pi05_base` 的**权重**并按本地数据构造输入特征；两路相机、12 维状态/动作、50 步 action chunk、执行 10 步；bfloat16、梯度检查点、冻结视觉语言模型并训练 action expert。默认单卡 batch size 8，偏向稳定启动；若显存充裕可提高到 16/32，并用 `nvidia-smi` 观察峰值。训练步数、batch size 和 worker 数均可通过脚本参数调整。更完整但显存需求更高的微调可添加 `--full-finetune`；建议先降低 batch size。其他未封装的 LeRobot 参数可附加在命令末尾。
+默认设置：加载 `lerobot/pi05_base` 的**权重**并按本地数据构造输入特征；两路相机、12 维状态/动作、50 步 action chunk、执行 10 步；bfloat16、梯度检查点、冻结视觉语言模型并训练 action expert。训练采样会跳过每条 episode 最后 49 个起点，只使用能在同一 episode 内取得完整 50 步动作块的样本；若覆盖 `--policy.chunk_size`，跳过帧数会同步调整。默认单卡 batch size 8，偏向稳定启动；若显存充裕可提高到 16/32，并用 `nvidia-smi` 观察峰值。训练步数、batch size 和 worker 数均可通过脚本参数调整。更完整但显存需求更高的微调可添加 `--full-finetune`；建议先降低 batch size。其他未封装的 LeRobot 参数可附加在命令末尾。
 
 日志默认每 20 步输出一次，检查点默认每 1000 步保存一次。训练运行期间，完整终端输出与 loss CSV 暂存在输出目录旁的 `<输出目录名>_train_logs/`；训练成功后移入 `--output/logs/`。若训练失败，日志留在暂存目录，且日志记录器不会提前创建 LeRobot 的输出目录。CSV 包含 `step`、原始步数标签、窗口平均 `loss`、梯度范数和学习率；每次启动生成新文件，不覆盖已有记录。可用 `--log-freq` 和 `--save-freq` 调整，例如：
 
@@ -117,11 +117,11 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 # Ctrl+B 然后 D 可退出 tmux，之后用 tmux attach -t pi05 返回。
 ```
 
-LeRobot 会在指定 `outputs/` 下保存训练配置和检查点。本仓库的 `pipeline train` 负责保存 loss 日志；直接运行 `lerobot-train` 或用下面的命令直接续训时，不会经过这个日志记录入口，应自行重定向输出或启用 W&B。续训时使用 LeRobot 自带接口，指向保存的 `train_config.json`，例如：
+LeRobot 会在指定 `outputs/` 下保存训练配置和检查点。本仓库的 `pipeline train` 负责保存 loss 日志；下面的续训命令不会经过这个日志记录入口，应自行重定向输出或启用 W&B。续训时使用相同的 episode 安全采样入口，指向保存的 `train_config.json`，例如：
 
 ```bash
 find outputs/pi05_vial -name train_config.json
-lerobot-train --config_path=/实际路径/train_config.json --resume=true
+python scripts/train_episode_safe.py --config_path=/实际路径/train_config.json --resume=true
 ```
 
 训练结果仍需在真实机器人上验证；离线训练 loss 不能单独说明抓取成功率。
