@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+from bisect import bisect_right
 from datetime import datetime
 from pathlib import Path
 
@@ -107,6 +108,101 @@ def unexpected_parquet_columns(features: dict, columns: list[str]) -> list[str]:
     """Find payload columns absent from info.json's non-video feature map."""
     expected = {key for key, value in features.items() if value.get("dtype") != "video"}
     return sorted(set(columns) - expected)
+
+
+def _dataset_index_issues(root: Path) -> list[tuple[Path, int, int]]:
+    """Validate physical row order against v3 episode ranges before trusting index."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    info = _read_json(root / "meta" / "info.json")
+    if info.get("codebase_version") != "v3.0":
+        raise ValueError("Index validation/repair requires a converted v3.0 dataset")
+    episode_paths = sorted((root / "meta" / "episodes").rglob("*.parquet"))
+    episodes = []
+    keys = ["episode_index", "dataset_from_index", "dataset_to_index", "length"]
+    for path in episode_paths:
+        table = pq.read_table(path, columns=keys)
+        if any(not pa.types.is_integer(table[key].type) or table[key].null_count for key in keys):
+            raise ValueError(f"Episode ranges must be non-null integers: {path}")
+        episodes.extend(table.to_pylist())
+    episodes.sort(key=lambda ep: ep["dataset_from_index"])
+    if len(episodes) != info["total_episodes"] or not episodes:
+        raise ValueError("Episode metadata count does not match info.json")
+    end = 0
+    for ep_idx, ep in enumerate(episodes):
+        if (ep["episode_index"] != ep_idx or ep["dataset_from_index"] != end
+                or ep["length"] <= 0 or ep["dataset_to_index"] != end + ep["length"]):
+            raise ValueError(f"Invalid/non-contiguous episode metadata: {ep}")
+        end = ep["dataset_to_index"]
+    if end != info["total_frames"]:
+        raise ValueError("Episode ranges do not sum to total_frames")
+    starts = [ep["dataset_from_index"] for ep in episodes]
+    offset = 0
+    issues = []
+    for path in sorted((root / "data").rglob("*.parquet")):
+        columns = ["index", "episode_index", "frame_index"]
+        table = pq.read_table(path, columns=columns)
+        if any(not pa.types.is_integer(table[key].type) or table[key].null_count for key in columns):
+            raise ValueError(f"Index columns must be non-null integers: {path}")
+        if offset + len(table) > end:
+            raise ValueError(f"Data rows exceed episode ranges: {path}")
+        wrong_index = False
+        for position, row in enumerate(table.to_pylist(), start=offset):
+            ep = episodes[bisect_right(starts, position) - 1]
+            if row["episode_index"] != ep["episode_index"] or row["frame_index"] != position - ep["dataset_from_index"]:
+                raise ValueError(f"episode_index/frame_index disagree with metadata at row {position}: {path}")
+            wrong_index |= row["index"] != position
+        if wrong_index:
+            issues.append((path, offset, len(table)))
+        offset += len(table)
+    if offset != end:
+        raise ValueError(f"Data row count {offset} does not match total_frames {end}")
+    return issues
+
+
+def validate_dataset_indices(root: Path) -> None:
+    """Reject episode-local indices that collapse future action chunks to frame zero."""
+    issues = _dataset_index_issues(root)
+    if issues:
+        raise ValueError(
+            f"Parquet index is not globally continuous in {issues[0][0]}. "
+            "Run 'python -m scripts.pipeline fix-indices --dataset <dataset>' before training."
+        )
+
+
+def repair_dataset_indices(root: Path, dry_run: bool = False) -> int:
+    """Rewrite only index, after validating every episode; preserve original files."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    issues = _dataset_index_issues(root)
+    if dry_run:
+        return len(issues)
+    # Preflight all targets before touching any file.
+    for path, _, _ in issues:
+        for suffix in (".before_index_fix", ".index_fix_tmp"):
+            if path.with_name(path.name + suffix).exists():
+                raise ValueError(f"Backup already exists or repair is incomplete; inspect before retrying: {path}{suffix}")
+    for path, start, count in issues:
+        backup = path.with_name(path.name + ".before_index_fix")
+        temp = path.with_name(path.name + ".index_fix_tmp")
+        original = pq.read_table(path)
+        field = original.schema.field("index")
+        fixed = original.set_column(original.schema.get_field_index("index"), field,
+                                    pa.array(range(start, start + count), type=field.type))
+        try:
+            pq.write_table(fixed, temp, compression="zstd")
+            if not pq.read_table(temp).equals(fixed):
+                raise ValueError(f"Index repair verification failed: {path}")
+            shutil.copy2(path, backup)
+            os.replace(temp, path)
+        finally:
+            if temp.exists():
+                temp.unlink()
+        print(f"Restored global index in {path}; backup: {backup}", flush=True)
+    validate_dataset_indices(root)
+    return len(issues)
 
 
 def _parquet_schema_issues(root: Path, features: dict) -> list[tuple[Path, list[str], list[str]]]:
@@ -217,6 +313,7 @@ def inspect_dataset(root: Path, check_schema: bool = True) -> dict:
                     f"Parquet columns differ from meta/info.json in {path}: "
                     f"undeclared={extra}, missing={missing}. Run 'repair' before training."
                 )
+            validate_dataset_indices(root)
     return {"root": str(root), "version": version, "episodes": episodes, "cameras": cameras}
 
 
@@ -326,7 +423,7 @@ def run_training_with_metrics(command: list[str], output: Path, log_freq: int) -
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("inspect", "convert", "repair", "fix-stats", "download", "train"))
+    parser.add_argument("action", choices=("inspect", "convert", "repair", "fix-stats", "fix-indices", "download", "train"))
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--lerobot", type=Path, default=DEFAULT_LEROBOT)
     parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
@@ -355,6 +452,10 @@ def main() -> None:
     summary = inspect_dataset(args.dataset, check_schema=args.action == "inspect" or args.action == "train")
     print(json.dumps(summary, indent=2), flush=True)
     if args.action == "inspect":
+        return
+    if args.action == "fix-indices":
+        count = repair_dataset_indices(args.dataset, dry_run=args.dry_run)
+        print(f"{'Would repair' if args.dry_run else 'Repaired'} index in {count} parquet files.")
         return
     if args.action == "repair":
         if args.dry_run:
@@ -399,6 +500,7 @@ def main() -> None:
             subprocess.run(command, check=True)
         if args.action == "convert":
             repair_parquet_schema(args.dataset)
+            repair_dataset_indices(args.dataset)
             source = args.source_stats or original_stats_path(args.dataset)
             changed = repair_quantile_stats(args.dataset, source)
             print(f"Global quantiles {'restored' if changed else 'already correct'} from {source}")

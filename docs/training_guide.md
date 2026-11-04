@@ -4,7 +4,7 @@
 
 ## 代码分工
 
-`scripts/pipeline.py` 是本仓库的入口，提供 `inspect`、`convert`、`repair`、`download`、`train` 五个动作。它检查本地数据，调用 LeRobot v0.6.1 的转换器与训练入口；模型结构、数据加载、损失计算和优化器均由 LeRobot 实现。本仓库没有自行实现 π₀.₅ 的训练循环。
+`scripts/pipeline.py` 是本仓库的入口，提供 `inspect`、`convert`、`repair`、`fix-stats`、`fix-indices`、`download`、`train`。它检查本地数据，调用 LeRobot v0.6.1 的转换器与训练入口；模型结构、数据加载、损失计算和优化器均由 LeRobot 实现。本仓库没有自行实现 π₀.₅ 的训练循环。
 
 ## π₀ 与本仓库使用的 π₀.₅
 
@@ -36,7 +36,7 @@ Hugging Face 基座权重 ────────────────downlo
 
 ## 训练前确认
 
-1. 安装 Python、FFmpeg、CUDA 版 PyTorch 和本地 LeRobot v0.6.1，并确保 `lerobot-train` 可执行。安装步骤见 [README 的环境安装章节](../README.md#2-安装环境)。
+1. 按 [README 的环境安装章节](../README.md#2-安装环境)创建 `venv`、安装 FFmpeg 和 LeRobot v0.6.1，并确认 CUDA 版 PyTorch 与 `lerobot-train` 可用。
 2. 把数据放在默认路径 `datasets/Lerobot_1028_12_dim/`，保留完整的 `meta/`、`data/`、`videos/` 目录；也可在命令中使用 `--dataset` 指定其他路径。
 3. 确认 GPU 可用，并为基座模型、原始数据备份、转换结果和训练输出预留磁盘空间。
 4. 登录有权访问 `google/paligemma-3b-pt-224` 的 Hugging Face 账号。`download` 只下载 `lerobot/pi05_base`；训练所需的 gated PaliGemma tokenizer 还需要相应访问权限。
@@ -78,6 +78,7 @@ python -m scripts.pipeline inspect
 
 ```bash
 python -m scripts.pipeline fix-stats
+python -m scripts.pipeline fix-indices
 python -m scripts.pipeline inspect
 ```
 
@@ -91,6 +92,14 @@ python -m scripts.pipeline inspect
 ```
 
 `repair` 只接受上述两个多余字段；若缺少已声明字段、遇到其他额外字段或已有同名备份，它会停止。转换中断时先检查数据目录及 `_old`、`_v30` 目录，不要直接删除备份或覆盖数据。
+
+#### 修复全局采样索引
+
+本地原始数据的 `index` 每个 episode 从 0 重新计数；v3 读取器把这个字段当作全局索引，与 `dataset_from_index/dataset_to_index` 比较。直接拼接 Parquet 会让大部分未来动作窗口错误地重复 episode 第一帧。例如 episode 7 的范围为 `[4499, 5268)`，原始 `index` 却是 `0…768`。
+
+现在 `convert` 在转换后自动修复 `index`。已经转换的数据使用 `python -m scripts.pipeline fix-indices`，可先加 `--dry-run` 查看待修复文件数。此操作逐行核对 `episode_index`、`frame_index` 与 episode 元数据；只有行顺序、长度、边界都一致时才修复。每个修改的 Parquet 保留 `.before_index_fix` 备份，其他列和视频不变。若已有同名备份但仍需修复，命令会停止，避免覆盖备份。修复完成后重复运行不会再次修改文件。
+
+`inspect` 和 `train` 在 v3 数据上校验全局索引，错误时阻止启动。修复后仍按原规则在 episode 末尾重复最后一个动作；无需改变 padding 或 loss。已经用错误索引训练的检查点需要从基座权重重新训练，使用新的输出目录，不应继续旧训练。
 
 ### 4. 短跑并正式训练
 
@@ -107,14 +116,14 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 python -m scripts.pipeline train \
   --dataset datasets/Lerobot_1028_12_dim \
   --weights models/pi05_base \
-  --output outputs/pi05_vial \
+  --output outputs/pi05_vial_1104 \
   --source-stats datasets/Lerobot_1028_12_dim_old/meta/stats.json \
-  --steps 30000 \
-  --batch-size 8 \
-  --chunk-size 50 \
-  --workers 4 \
-  --log-freq 20 \
-  --save-freq 1000
+  --steps 10000 \
+  --batch-size 32 \
+  --chunk-size 25 \
+  --workers 8 \
+  --log-freq 100 \
+  --save-freq 10000
 ```
 
 `--source-stats` 可省略，此时脚本会自动查找上面所示的转换备份。需要训练整个视觉语言模型时，在命令末尾添加 `--full-finetune`；只想打印命令并做前置检查时添加 `--dry-run`。`--lerobot` 和 `--repo-id` 仅供转换使用，不会改变 `train` 的命令。其他 LeRobot 训练参数可以追加在末尾，但须以实际安装版本的 `lerobot-train --help` 为准。

@@ -30,24 +30,19 @@ test -d datasets/Lerobot_1028_12_dim/videos
 
 ### 2. 安装环境
 
-推荐 Miniforge 的 Python 3.12 环境；系统已有兼容 Conda 时可跳过安装 Miniforge。LeRobot 当前[安装说明](https://huggingface.co/docs/lerobot/v0.6.1/installation)采用 Python 3.12 和环境内 FFmpeg。Ubuntu 24.04 自带的系统 Python 3.12 也可用于虚拟环境，但请确保 PyTorch/CUDA 与 FFmpeg 兼容。
+以下按 root 用户、服务器已预装 Python 3、Git 和编译工具编写。用系统 Python 建立虚拟环境；确认 PyTorch/CUDA 与 FFmpeg 兼容。
 
 ```bash
-sudo apt update
-sudo apt install -y git git-lfs curl build-essential pkg-config
-git lfs install
-# 若尚未安装 Conda/Miniforge：
-curl -L -o /tmp/miniforge.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
-bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
-source "$HOME/miniforge3/etc/profile.d/conda.sh"
-conda create -y -n pi05 python=3.12
-conda activate pi05
-conda install -y -c conda-forge ffmpeg
+apt update
+apt install -y zip unzip ffmpeg
+python3 -m venv venv
+source venv/bin/activate
 
 git clone --branch v0.6.1 --depth 1 https://github.com/huggingface/lerobot.git lerobot
-python -m pip install --upgrade pip
+cd lerobot
 env -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
-    python -m pip install -e './lerobot[training,pi]'
+    python -m pip install -e '.[training,pi]'
+cd ..
 python -c 'import torch, lerobot; print("torch", torch.__version__, "CUDA", torch.version.cuda); print("GPU", torch.cuda.get_device_name(0))'
 ffmpeg -version
 ```
@@ -87,6 +82,16 @@ python -m scripts.pipeline inspect
 
 `repair` 只处理 `next_reward`、`next_done` 这两个多余字段，不会再次转换视频或上传数据。若出现其他未声明字段，它会停止并报告列名。
 
+原始数据每个 episode 的 `index` 都从 0 开始；v3 读取器要求它是全局连续索引，否则未来动作窗口会被错误裁到 episode 第一帧。现在 `convert` 会自动修复转换结果的 `index`，并留下 `.before_index_fix` 备份。已经转换的数据请运行：
+
+```bash
+python -m scripts.pipeline fix-indices --dry-run
+python -m scripts.pipeline fix-indices
+python -m scripts.pipeline inspect
+```
+
+修复只改 `index`，保留 episode 内的 `frame_index`、动作、时间戳和视频。`inspect` 和 `train` 会拒绝错误索引。已经用错误索引训练的模型需要从基座权重重新训练，使用新的输出目录。
+
 ### 5. 启动训练
 
 建议先跑 2 步验证完整链路，再正式训练。预检只检查文件和元数据；真正的视频解码、tokenizer 和 CUDA 路径由这次短跑验证。
@@ -112,8 +117,8 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --log-freq 10 --sa
 
 ```bash
 tmux new -s pi05
-conda activate pi05
 cd /path/to/TrainPi0.5
+source venv/bin/activate
 python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --output outputs/pi05_vial
 # Ctrl+B 然后 D 可退出 tmux，之后用 tmux attach -t pi05 返回。
 ```
