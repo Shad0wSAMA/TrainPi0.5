@@ -263,7 +263,6 @@ def build_train_command(
         f"--save_freq={save_freq}",
         f"--log_freq={log_freq}",
         "--seed=1000",
-        "--wandb.enable=false",
     ]
 
 

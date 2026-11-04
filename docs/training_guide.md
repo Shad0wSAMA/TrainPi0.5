@@ -120,7 +120,7 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 | 动作预测 | `chunk_size=50`、`n_action_steps=10`、`empty_cameras=0` | `--chunk-size` 可调整预测长度；执行步数最多为 10 |
 | 训练规模 | 30,000 steps、batch 8、workers 4 | 可用 `--steps`、`--batch-size`、`--workers` 调整 |
 | 记录与保存 | `save_freq=1000`、`log_freq=20`、seed 1000 | 每 1,000 步保存、每 20 步记录 |
-| 在线服务 | `policy.push_to_hub=false`、`wandb.enable=false` | 默认不上传策略、不启用 W&B |
+| 在线服务 | `policy.push_to_hub=false`；W&B 使用 LeRobot 默认的关闭状态 | 默认不上传策略、不启用 W&B |
 
 可用 `--dry-run` 打印将执行的命令；但它仍会做数据和权重的前置检查。`--full-finetune` 会提高显存需求，建议从较小 batch 开始。训练命令末尾还可追加未封装的 LeRobot 参数；若参数与脚本默认项重复，应检查最终打印的命令及 LeRobot 的解析结果。
 
