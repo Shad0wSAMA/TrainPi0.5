@@ -1,16 +1,18 @@
 import json
 import csv
+import io
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.pipeline import (
     build_train_command, ensure_quantile_stats_match, inspect_dataset,
-    make_conversion_command, repair_quantile_stats, run_training_with_metrics,
+    main, make_conversion_command, repair_quantile_stats, run_training_with_metrics,
     unexpected_parquet_columns,
 )
-from scripts.train_episode_safe import configure_episode_safe_sampling
 
 
 def sample_dataset(root: Path, version: str = "v2.1") -> None:
@@ -48,20 +50,30 @@ def sample_dataset(root: Path, version: str = "v2.1") -> None:
 
 
 class PipelineTest(unittest.TestCase):
-    def test_training_uses_episode_safe_entrypoint(self):
+    def test_training_uses_lerobot_default_episode_padding(self):
         command = build_train_command(Path("/data/demo"), Path("/weights/pi05_base"), Path("/runs/demo"), 8, 100, 2)
-        self.assertEqual(command[:2], [sys.executable, str(Path(__file__).resolve().parents[1] / "scripts" / "train_episode_safe.py")])
+        self.assertEqual(command[0], "lerobot-train")
 
-    def test_sampler_drops_tail_without_a_full_action_chunk(self):
-        class PolicyConfig:
-            chunk_size = 3
+    def test_train_command_sets_prediction_chunk_size(self):
+        command = build_train_command(Path("/data/demo"), Path("/weights/pi05_base"), Path("/runs/demo"), 8, 100, 2, chunk_size=24)
+        self.assertIn("--policy.chunk_size=24", command)
+        self.assertIn("--policy.n_action_steps=10", command)
+        short = build_train_command(Path("/data/demo"), Path("/weights/pi05_base"), Path("/runs/demo"), 8, 100, 2, chunk_size=6)
+        self.assertIn("--policy.n_action_steps=6", short)
+        with self.assertRaisesRegex(ValueError, "chunk-size"):
+            build_train_command(Path("/data/demo"), Path("/weights/pi05_base"), Path("/runs/demo"), 8, 100, 2, chunk_size=0)
 
-        configure_episode_safe_sampling(PolicyConfig)
-        config = PolicyConfig()
-        self.assertEqual(config.drop_n_last_frames, 2)
-        self.assertEqual([start for start in range(4 - config.drop_n_last_frames)], [0, 1])
-        config.chunk_size = 4
-        self.assertEqual(config.drop_n_last_frames, 3)
+    def test_train_cli_passes_chunk_size_to_lerobot(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            weights = Path(tmp) / "weights"
+            weights.mkdir()
+            (weights / "config.json").touch()
+            argv = ["pipeline", "train", "--weights", str(weights), "--chunk-size", "6", "--dry-run"]
+            output = io.StringIO()
+            with patch.object(sys, "argv", argv), patch("scripts.pipeline.inspect_dataset", return_value={"version": "v3.0"}), patch("scripts.pipeline.ensure_quantile_stats_match"), redirect_stdout(output):
+                main()
+            self.assertIn("--policy.chunk_size=6", output.getvalue())
+            self.assertIn("--policy.n_action_steps=6", output.getvalue())
 
     def test_repairs_only_quantiles_and_keeps_backup(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:

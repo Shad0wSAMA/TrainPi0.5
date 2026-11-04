@@ -26,7 +26,7 @@ PaliGemma 形成图像与语言条件的前缀；另一个 Gemma action expert �
 
 不能仅凭原始数据是绝对关节位置就决定关闭相对动作。启用 `use_relative_actions=true` 后，LeRobot 在训练前对选中的维度计算 `a_relative = a_absolute - 当前 observation.state`，模型学习从当前姿态到目标姿态的偏移；后处理再加回当前状态，给机器人输出绝对目标。默认 `relative_exclude_joints=["gripper"]`，名称含 `gripper` 的夹爪维度仍保持绝对值。实现见 [相对动作处理器](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/processor/relative_action_processor.py)。
 
-这种表示可能更适合“从当前姿态移动到目标”的任务，但并非 π₀.₅ 的普遍最优设置。[官方 π₀.₅ 指南](https://huggingface.co/docs/lerobot/v0.6.1/pi05#relative-actions)也只说它在某些设置下可能改善稳定性。本仓库当前 `meta/stats.json` 的动作统计是**绝对动作分布**；若直接追加 `--policy.use_relative_actions=true`，处理器会先减去状态、再使用不匹配的绝对动作统计归一化，因此不应直接这样训练。应先在独立数据副本上按 `chunk_size=50` 重算相对动作统计，再使用相同的排除维度配置训练，并保留原绝对动作实验作为对照。对这份数据，先确认动作与状态前六维逐一对应、单位一致，尤其要核对夹爪是否应保持绝对值；后六维零填充减去零状态仍为零。
+这种表示可能更适合“从当前姿态移动到目标”的任务，但并非 π₀.₅ 的普遍最优设置。[官方 π₀.₅ 指南](https://huggingface.co/docs/lerobot/v0.6.1/pi05#relative-actions)也只说它在某些设置下可能改善稳定性。本仓库当前 `meta/stats.json` 的动作统计是**绝对动作分布**；若直接追加 `--policy.use_relative_actions=true`，处理器会先减去状态、再使用不匹配的绝对动作统计归一化，因此不应直接这样训练。应先在独立数据副本上按训练实际使用的 `chunk_size` 重算相对动作统计，再使用相同的排除维度配置训练，并保留原绝对动作实验作为对照。对这份数据，先确认动作与状态前六维逐一对应、单位一致，尤其要核对夹爪是否应保持绝对值；后六维零填充减去零状态仍为零。
 
 ```text
 原始 LeRobot v2.1 数据 ──inspect──> convert ──> v3.0 数据 ──inspect──┐
@@ -101,13 +101,13 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 短跑用于实际验证视频解码、tokenizer 访问、CUDA 和模型前向/反向路径。正式训练建议用 `tmux` 保持会话，观察日志、GPU 显存和磁盘空间。训练输出由 LeRobot 写入 `--output` 指定的目录。
 
-一次训练更新中，LeRobot 从 episode 中采样帧和未来动作窗口，解码两路视频，准备任务文本，归一化状态与动作；然后计算 flow matching loss、反向传播、更新优化器与学习率计划。训练入口会从每条 episode 的可用采样起点中排除最后 `chunk_size - 1` 帧，确保未来动作窗口完整位于同一 episode。终端日志中的 `loss` 是**归一化空间的流匹配损失**，并非实际关节单位下的跟踪 MSE。π₀.₅ 虽在前向结果中提供 `loss_per_dim` 列表，但当前 LeRobot 日志聚合器只记录数值标量，不会把该列表逐维写入终端。当前脚本每 20 步打印日志、每 1,000 步保存检查点。训练代码见 [LeRobot v0.6.1 训练入口](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/scripts/lerobot_train.py)。
+一次训练更新中，LeRobot 从 episode 中采样帧和未来动作窗口，解码两路视频，准备任务文本，归一化状态与动作；然后计算 flow matching loss、反向传播、更新优化器与学习率计划。动作窗口越过 episode 末尾时，LeRobot 会重复该 episode 最后一帧动作来补齐，不会接到下一条 episode。终端日志中的 `loss` 是**归一化空间的流匹配损失**，并非实际关节单位下的跟踪 MSE。π₀.₅ 虽在前向结果中提供 `loss_per_dim` 列表，但当前 LeRobot 日志聚合器只记录数值标量，不会把该列表逐维写入终端。当前脚本每 20 步打印日志、每 1,000 步保存检查点。训练代码见 [LeRobot v0.6.1 训练入口](https://github.com/huggingface/lerobot/blob/v0.6.1/src/lerobot/scripts/lerobot_train.py)。
 
 本仓库的 `pipeline train` 会把终端输出实时保存到 `--output` 同级的 `<输出目录名>_train_logs/train_<时间>.log`，并将每次打印的窗口平均 `loss`、梯度范数和学习率写入同级的 `loss_<时间>.csv`。训练成功后这两个文件移到 `--output/logs/`；失败时留在暂存目录。这样 LeRobot 启动前不会因为日志目录而发现已存在的输出目录。每次启动都会生成新文件；CSV 中的 loss 精度与 LeRobot 终端打印值相同，且不是每一步的原始 loss。当前脚本仍关闭 W&B。直接调用续训入口不会经过这个日志记录入口，需自行保存终端输出或启用 W&B。
 
 ## 当前训练配置
 
-`train` 先要求数据已是 v3.0，并检查权重目录中存在 `config.json`，随后通过 `scripts/train_episode_safe.py` 启动 LeRobot。关键默认值如下：
+`train` 先要求数据已是 v3.0，并检查权重目录中存在 `config.json`，随后调用 `lerobot-train`。关键默认值如下：
 
 | 项目 | 当前值 | 影响 |
 | --- | --- | --- |
@@ -117,7 +117,7 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 | 策略 | `--policy.type=pi05`、本地 `--policy.pretrained_path` | 从基座权重微调 |
 | 精度与显存 | CUDA、`bfloat16`、梯度检查点 | 降低显存压力，仍需按实际显存调整 batch |
 | 默认微调范围 | `freeze_vision_encoder=true`、`train_expert_only=true` | 默认训练 action expert；`--full-finetune` 会把两项设为 `false` |
-| 动作预测 | `chunk_size=50`、`n_action_steps=10`、`empty_cameras=0` | 与部署端的动作执行方式和相机输入保持一致 |
+| 动作预测 | `chunk_size=50`、`n_action_steps=10`、`empty_cameras=0` | `--chunk-size` 可调整预测长度；执行步数最多为 10 |
 | 训练规模 | 30,000 steps、batch 8、workers 4 | 可用 `--steps`、`--batch-size`、`--workers` 调整 |
 | 记录与保存 | `save_freq=1000`、`log_freq=20`、seed 1000 | 每 1,000 步保存、每 20 步记录 |
 | 在线服务 | `policy.push_to_hub=false`、`wandb.enable=false` | 默认不上传策略、不启用 W&B |
@@ -135,11 +135,11 @@ python -m scripts.pipeline train --steps 30000 --batch-size 8 --workers 4 --outp
 
 ## 续训与常用检查
 
-已有 LeRobot 训练配置时，可按 README 中的方式用 episode 安全入口续训：
+已有 LeRobot 训练配置时，可按 README 中的方式用 LeRobot 自带入口续训：
 
 ```bash
 find outputs/pi05_vial -name train_config.json
-python scripts/train_episode_safe.py --config_path=/实际路径/train_config.json --resume=true
+lerobot-train --config_path=/实际路径/train_config.json --resume=true
 ```
 
 `pipeline.py` 本身没有 `resume` 动作。自定义路径和参数可先查看帮助并做 dry run：

@@ -230,14 +230,16 @@ def make_conversion_command(lerobot: Path, dataset: Path, repo_id: str) -> list[
 def build_train_command(
     dataset: Path, weights: Path, output: Path, batch_size: int, steps: int, workers: int,
     full_finetune: bool = False, log_freq: int = 20, save_freq: int = 1000,
+    chunk_size: int = 50,
 ) -> list[str]:
     if min(batch_size, steps) < 1 or workers < 0:
         raise ValueError("batch-size and steps must be positive; workers cannot be negative")
     if log_freq < 1:
         raise ValueError("log-freq must be positive")
+    if chunk_size < 1:
+        raise ValueError("chunk-size must be positive")
     return [
-        sys.executable,
-        str(REPO_ROOT / "scripts" / "train_episode_safe.py"),
+        "lerobot-train",
         "--dataset.repo_id=local/pi05_vial",
         f"--dataset.root={dataset.resolve()}",
         "--dataset.video_backend=pyav",
@@ -249,8 +251,8 @@ def build_train_command(
         "--policy.gradient_checkpointing=true",
         f"--policy.freeze_vision_encoder={str(not full_finetune).lower()}",
         f"--policy.train_expert_only={str(not full_finetune).lower()}",
-        "--policy.chunk_size=50",
-        "--policy.n_action_steps=10",
+        f"--policy.chunk_size={chunk_size}",
+        f"--policy.n_action_steps={min(10, chunk_size)}",
         "--policy.empty_cameras=0",
         "--policy.push_to_hub=false",
         f"--output_dir={output.resolve()}",
@@ -334,6 +336,7 @@ def main() -> None:
     parser.add_argument("--source-stats", type=Path, default=None, help="Original v2.1 meta/stats.json; defaults to the *_old conversion backup")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=30000)
+    parser.add_argument("--chunk-size", type=int, default=50, help="Predicted action chunk length; default 50")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--log-freq", type=int, default=20, help="Log every N training steps")
     parser.add_argument("--save-freq", type=int, default=1000, help="Save every N steps; 0 saves only at the end")
@@ -386,6 +389,7 @@ def main() -> None:
         command = build_train_command(
             args.dataset, args.weights, args.output, args.batch_size, args.steps, args.workers,
             full_finetune=args.full_finetune, log_freq=args.log_freq, save_freq=args.save_freq,
+            chunk_size=args.chunk_size,
         )
         command += extra
     print("Command:", " ".join(command), flush=True)
