@@ -118,7 +118,7 @@ python -m scripts.pipeline train \
   --weights models/pi05_base \
   --output outputs/pi05_vial_1104 \
   --source-stats datasets/Lerobot_1028_12_dim_old/meta/stats.json \
-  --steps 10000 \
+  --steps 20000 \
   --batch-size 32 \
   --chunk-size 25 \
   --workers 8 \

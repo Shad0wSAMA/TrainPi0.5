@@ -327,7 +327,7 @@ def make_conversion_command(lerobot: Path, dataset: Path, repo_id: str) -> list[
 def build_train_command(
     dataset: Path, weights: Path, output: Path, batch_size: int, steps: int, workers: int,
     full_finetune: bool = False, log_freq: int = 20, save_freq: int = 1000,
-    chunk_size: int = 50,
+    chunk_size: int = 50, rtc_max_delay: int = 0,
 ) -> list[str]:
     if min(batch_size, steps) < 1 or workers < 0:
         raise ValueError("batch-size and steps must be positive; workers cannot be negative")
@@ -335,7 +335,9 @@ def build_train_command(
         raise ValueError("log-freq must be positive")
     if chunk_size < 1:
         raise ValueError("chunk-size must be positive")
-    return [
+    if rtc_max_delay < 0 or rtc_max_delay >= chunk_size:
+        raise ValueError("rtc max delay must be nonnegative and smaller than chunk-size")
+    command = [
         "lerobot-train",
         "--dataset.repo_id=local/pi05_vial",
         f"--dataset.root={dataset.resolve()}",
@@ -361,6 +363,10 @@ def build_train_command(
         f"--log_freq={log_freq}",
         "--seed=1000",
     ]
+    if rtc_max_delay:
+        command[0:1] = [sys.executable, "-m", "lerobot.scripts.lerobot_train"]
+        command.append(f"--policy.rtc_training_max_delay={rtc_max_delay}")
+    return command
 
 
 def run_training_with_metrics(command: list[str], output: Path, log_freq: int) -> tuple[Path, Path]:
@@ -433,6 +439,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=30000)
     parser.add_argument("--chunk-size", type=int, default=50, help="Predicted action chunk length; default 50")
+    parser.add_argument("--rtc-max-delay", type=int, default=0, help="Enable trained RTC with this maximum action prefix length")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--log-freq", type=int, default=20, help="Log every N training steps")
     parser.add_argument("--save-freq", type=int, default=1000, help="Save every N steps; 0 saves only at the end")
@@ -489,12 +496,19 @@ def main() -> None:
         command = build_train_command(
             args.dataset, args.weights, args.output, args.batch_size, args.steps, args.workers,
             full_finetune=args.full_finetune, log_freq=args.log_freq, save_freq=args.save_freq,
-            chunk_size=args.chunk_size,
+            chunk_size=args.chunk_size, rtc_max_delay=args.rtc_max_delay,
         )
         command += extra
     print("Command:", " ".join(command), flush=True)
     if not args.dry_run:
         if args.action == "train":
+            if args.rtc_max_delay:
+                check = ("import inspect; from lerobot.policies.pi05.configuration_pi05 import PI05Config; "
+                         "from lerobot.policies.pi05 import modeling_pi05 as m; "
+                         "assert hasattr(PI05Config(), 'rtc_training_max_delay'); "
+                         "assert all(hasattr(m, n) for n in ('_sample_training_rtc_prefix_mask', '_reduce_training_rtc_loss', '_prepare_trained_rtc_prefix')); "
+                         "print('RTC LeRobot implementation:', inspect.getfile(m), flush=True)")
+                subprocess.run([sys.executable, "-c", check], check=True)
             run_training_with_metrics(command, args.output, args.log_freq)
         else:
             subprocess.run(command, check=True)

@@ -50,6 +50,13 @@ def sample_dataset(root: Path, version: str = "v2.1") -> None:
 
 
 class PipelineTest(unittest.TestCase):
+    def test_rtc_train_command_uses_prefix_conditioning(self):
+        command = build_train_command(Path("/data"), Path("/base"), Path("/out"), 8, 100, 2, chunk_size=40, rtc_max_delay=15)
+        self.assertIn("--policy.rtc_training_max_delay=15", command)
+        self.assertIn("--policy.train_expert_only=true", command)
+        with self.assertRaisesRegex(ValueError, "rtc"):
+            build_train_command(Path("/data"), Path("/base"), Path("/out"), 8, 100, 2, chunk_size=15, rtc_max_delay=15)
+
     def test_training_uses_lerobot_default_episode_padding(self):
         command = build_train_command(Path("/data/demo"), Path("/weights/pi05_base"), Path("/runs/demo"), 8, 100, 2)
         self.assertEqual(command[0], "lerobot-train")
